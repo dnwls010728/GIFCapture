@@ -17,7 +17,7 @@
     <Product>GIF Capture</Product>
     <AssemblyTitle>GIF Capture</AssemblyTitle>
     <Description>화면 영역을 녹화해 GIF로 편집·저장하는 도구</Description>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
   </PropertyGroup>
 
   <ItemGroup>
