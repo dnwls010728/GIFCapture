@@ -17,7 +17,7 @@ sealed class RegionFrame : Form
     readonly float _s;
     readonly Font _font;
     Rectangle _sel;
-    bool _recording;
+    bool _recording, _captureHidden;
     Zone _drag, _hover;
     Point _dragStart;
     Rectangle _dragOrigin;
@@ -62,8 +62,22 @@ sealed class RegionFrame : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        Native.SetWindowDisplayAffinity(Handle, Native.WDA_EXCLUDEFROMCAPTURE);
+        UpdateCaptureAffinity();
         Render();
+    }
+
+    /// <summary>Hides the outline from screen captures on behalf of the owner (recording, previews, region picking).</summary>
+    public void SetCaptureHidden(bool hidden)
+    {
+        _captureHidden = hidden;
+        UpdateCaptureAffinity();
+    }
+
+    // Excluded only when needed, so other programs can capture the outline while idle.
+    // During a drag it must stay out of the loupe's magnified screen grab.
+    void UpdateCaptureAffinity()
+    {
+        if (IsHandleCreated) Native.SetCaptureExcluded(Handle, _captureHidden || _recording || _drag != Zone.None);
     }
 
     Rectangle WindowBounds => new(_sel.X - Band, _sel.Y - Band - TabH, _sel.Width + Band * 2, _sel.Height + Band * 2 + TabH);
@@ -130,6 +144,7 @@ sealed class RegionFrame : Form
             ex = recording ? ex | Native.WS_EX_TRANSPARENT : ex & ~Native.WS_EX_TRANSPARENT;
             Native.SetWindowLongPtr(Handle, Native.GWL_EXSTYLE, (IntPtr)ex);
         }
+        UpdateCaptureAffinity();
         Render();
     }
 
@@ -276,6 +291,7 @@ sealed class RegionFrame : Form
         var zone = HitTest(e.Location);
         if (zone is Zone.None or Zone.Close) return;
         _drag = zone;
+        UpdateCaptureAffinity();
         _dragStart = Cursor.Position;
         _dragOrigin = _sel;
     }
@@ -354,6 +370,7 @@ sealed class RegionFrame : Form
         if (_drag != Zone.None)
         {
             _drag = Zone.None;
+            UpdateCaptureAffinity();
             _loupe?.Hide();
             SelectionChanged?.Invoke(_sel, true);
         }

@@ -7,6 +7,7 @@ static class Native
 {
     public const int WM_HOTKEY = 0x0312;
     public const uint MOD_NOREPEAT = 0x4000;
+    public const uint WDA_NONE = 0;
     public const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
     public const int WS_EX_TRANSPARENT = 0x20;
     public const int WS_EX_TOOLWINDOW = 0x80;
@@ -175,6 +176,14 @@ static class Native
 
     [DllImport("dwmapi.dll")]
     public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    /// <summary>Blocks until DWM composes the next frame, so a display-affinity change is visible to screen grabs.</summary>
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmFlush();
+
+    /// <summary>Hides <paramref name="hWnd"/> from every screen capture (this app's and other programs') while <paramref name="excluded"/> is true.</summary>
+    public static void SetCaptureExcluded(IntPtr hWnd, bool excluded) =>
+        SetWindowDisplayAffinity(hWnd, excluded ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
 
     [DllImport("winmm.dll")]
     public static extern uint timeBeginPeriod(uint uPeriod);

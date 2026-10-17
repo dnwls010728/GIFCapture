@@ -47,6 +47,7 @@ sealed class MainForm : Form
     Size _windowOffset;          // region top-left relative to the target window
     string _targetName = "";
     RegionFrame? _frame;
+    bool _captureHidden;
     Recorder? _recorder;
     KeyboardTracker? _keyTracker;
     CancellationTokenSource? _countdownCts;
@@ -175,8 +176,7 @@ sealed class MainForm : Form
     {
         base.OnHandleCreated(e);
         Native.ApplyDarkTitleBar(Handle, Theme.Bg);
-        // Keep this window out of every recording, even when it overlaps the region.
-        Native.SetWindowDisplayAffinity(Handle, Native.WDA_EXCLUDEFROMCAPTURE);
+        Native.SetCaptureExcluded(Handle, _captureHidden);
         _hotkeyOk = Native.RegisterHotKey(Handle, HotkeyId, Native.MOD_NOREPEAT, (uint)Keys.F9);
     }
 
@@ -274,7 +274,9 @@ sealed class MainForm : Form
         }
         else
         {
-            using var selector = new RegionSelector(mode);
+            RegionSelector selector = null!;
+            GrabHidden(() => selector = new RegionSelector(mode));
+            using var _ = selector;
             if (selector.ShowDialog(this) != DialogResult.OK) return;
             region = selector.Selection;
             window = selector.SelectedWindow;
@@ -362,6 +364,7 @@ sealed class MainForm : Form
             _frame = new RegionFrame(_region, DeviceDpi / 96f);
             _frame.SelectionChanged += OnFrameDragged;
             _frame.CloseRequested += (_, _) => ClearTarget();
+            _frame.SetCaptureHidden(_captureHidden);
         }
         else
         {
@@ -497,9 +500,34 @@ sealed class MainForm : Form
         using (var g = Graphics.FromImage(bmp))
         {
             g.Clear(Color.Black);
-            g.CopyFromScreen(r.Location, new Point(r.X - _region.X, r.Y - _region.Y), r.Size);
+            GrabHidden(() => g.CopyFromScreen(r.Location, new Point(r.X - _region.X, r.Y - _region.Y), r.Size));
         }
         ReplacePreview(bmp);
+    }
+
+    /// <summary>
+    /// Keeps this window and the outline out of screen captures. Only on while recording, so other
+    /// programs (screenshots, screen sharing) can still see the app the rest of the time.
+    /// </summary>
+    void SetCaptureHidden(bool hidden)
+    {
+        _captureHidden = hidden;
+        if (IsHandleCreated) Native.SetCaptureExcluded(Handle, hidden);
+        _frame?.SetCaptureHidden(hidden);
+    }
+
+    /// <summary>Runs one of the app's own screen grabs with this window and the outline hidden from it.</summary>
+    void GrabHidden(Action grab)
+    {
+        if (_captureHidden)
+        {
+            grab();
+            return;
+        }
+        SetCaptureHidden(true);
+        Native.DwmFlush();
+        try { grab(); }
+        finally { SetCaptureHidden(false); }
     }
 
     void ReplacePreview(Image? image)
@@ -631,9 +659,11 @@ sealed class MainForm : Form
         _openFolder.Visible = _editLast.Visible = false;
         SetControlsEnabled(false);
         ShowFrame();
+        SetCaptureHidden(true);
 
         if (_settings.Countdown && !await RunCountdown())
         {
+            SetCaptureHidden(false);
             _frame?.SetRecording(false);
             SetControlsEnabled(true);
             ShowReadyStatus();
@@ -716,6 +746,7 @@ sealed class MainForm : Form
         _recorder = null;
         _recordButton.Recording = false;
         _preview.Live = false;
+        SetCaptureHidden(false);
         _frame?.SetRecording(false);
         if (recorder.Error == null && _mode != SelectMode.Screen) SetRegion(recorder.CurrentRegion);
         _frame?.SetSelection(_region);
