@@ -1,0 +1,14 @@
+# Build output
+bin/
+obj/
+publish/
+
+# IDE / tooling
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Local assistant configuration
+.claude/
