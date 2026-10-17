@@ -19,6 +19,14 @@ GIF Capture は、画面を録画してGIFにする軽量な Windows アプリ�
 
 アカウント登録、アップロード、クラウドはありません。録画した画面とGIFはこのPCにのみ保存されます。
 
+## ダウンロード
+
+**[⬇ GifCapture.exe をダウンロード（最新版）](https://github.com/dnwls010728/GIFCapture/releases/latest/download/GifCapture.exe)**
+
+Windows 10 2004 以降 / Windows 11（64ビット）向けの単一実行ファイルです。インストールも .NET のインストールも不要で、そのまま実行できます。
+初回起動時に Windows SmartScreen の警告が出た場合は **詳細情報 → 実行** を選んでください。
+すべてのバージョンは [Releases](https://github.com/dnwls010728/GIFCapture/releases) ページにあります。
+
 ## 機能
 
 **録画**

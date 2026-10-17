@@ -19,6 +19,14 @@ press **F9** again, and you have a GIF — or open the editor first to trim, cap
 
 Nothing leaves your computer. There is no account, no upload and no cloud: recordings and GIFs are saved only on this PC.
 
+## Download
+
+**[⬇ Download GifCapture.exe (latest release)](https://github.com/dnwls010728/GIFCapture/releases/latest/download/GifCapture.exe)**
+
+A single self-contained file for Windows 10 2004+ / Windows 11 (64-bit): no installer, no .NET install. Just run it.
+If Windows SmartScreen warns about an unsigned app, choose **More info → Run anyway**.
+All versions are on the [Releases](https://github.com/dnwls010728/GIFCapture/releases) page.
+
 ## Features
 
 **Recording**

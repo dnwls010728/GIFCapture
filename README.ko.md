@@ -19,6 +19,14 @@ GIF가 완성됩니다. 필요하면 편집기에서 자르고, 자막을 넣고
 
 계정도, 업로드도, 클라우드도 없습니다. 녹화한 화면과 GIF는 이 PC에만 저장됩니다.
 
+## 다운로드
+
+**[⬇ GifCapture.exe 내려받기 (최신 버전)](https://github.com/dnwls010728/GIFCapture/releases/latest/download/GifCapture.exe)**
+
+Windows 10 2004 이상 / Windows 11(64비트)용 단일 실행 파일입니다. 설치나 .NET 설치 없이 바로 실행하면 됩니다.
+처음 실행할 때 Windows SmartScreen 경고가 나오면 **추가 정보 → 실행**을 누르세요.
+모든 버전은 [Releases](https://github.com/dnwls010728/GIFCapture/releases) 페이지에 있습니다.
+
 ## 기능
 
 **녹화**
