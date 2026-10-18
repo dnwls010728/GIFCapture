@@ -12,7 +12,8 @@ sealed record ExportOptions(
     int Quality,                 // 10..100
     int MaxFps,                  // 0 = keep every frame
     bool MergeSimilar,
-    int PlayCount)               // 0 = loop forever
+    int PlayCount,               // 0 = loop forever
+    ResampleMode Resample = ResampleMode.Sharp) // used when enlarging
 {
     public int MaxColors => Quality >= 100 ? 256 : 16 + (int)Math.Round(240 * (Quality - 10) / 90.0);
     public int Tolerance => Quality >= 100 ? 0 : (int)Math.Round((100 - Quality) * 0.3);
@@ -122,7 +123,7 @@ static class GifExporter
             ct.ThrowIfCancellationRequested();
             var px = store.Read(groups[i].Source);
             if (!o.Crop.IsEmpty) px = FrameOps.Crop(px, src, o.Crop);
-            if (scaled != cropped) px = FrameOps.Scale(px, cropped, scaled);
+            if (scaled != cropped) px = FrameOps.Scale(px, cropped, scaled, o.Resample);
             if (o.Rotate != RotateFlipType.RotateNoneFlipNone) px = FrameOps.RotateFlip(px, scaled, o.Rotate);
             if (!string.IsNullOrWhiteSpace(groups[i].Caption)) px = Caption.Burn(px, outSize, groups[i].Caption!);
 

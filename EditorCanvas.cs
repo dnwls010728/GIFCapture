@@ -140,6 +140,59 @@ sealed class EditorCanvas : Control
         return _rotated;
     }
 
+    // ───────────── Output scale preview ─────────────
+
+    float _outputScale = 1;
+    ResampleMode _resample;
+    Bitmap? _piece;
+    (int Version, RotateFlipType Rotate, Rectangle Src, Rectangle Piece, float Scale, ResampleMode Mode) _pieceKey;
+
+    /// <summary>Export scale (1 = 100%). Zoom is measured against the scaled output, so 100% shows real output pixels.</summary>
+    public float OutputScale
+    {
+        get => _outputScale;
+        set { if (_outputScale == value) return; _outputScale = value; Invalidate(); }
+    }
+
+    public ResampleMode Resample
+    {
+        get => _resample;
+        set { if (_resample == value) return; _resample = value; Invalidate(); }
+    }
+
+    /// <summary>
+    /// Draws the visible part of the output exactly as the export renders it. Only the on-screen region is scaled, so
+    /// memory stays bounded by the window size however large the output is. Resampling commutes with rotation and flips,
+    /// so working on the already rotated view matches the export.
+    /// </summary>
+    void DrawOutputPiece(Graphics g, Bitmap image, Rectangle src, float k)
+    {
+        var visible = RectangleF.Intersect(_dest, ClientRectangle);
+        if (visible.IsEmpty) return;
+        float d = _scale * k; // screen pixels per source pixel
+        // A small margin gives the filters real neighbours at the piece edges.
+        int x0 = Math.Max(0, (int)Math.Floor((visible.Left - _dest.X) / d) - 2);
+        int y0 = Math.Max(0, (int)Math.Floor((visible.Top - _dest.Y) / d) - 2);
+        int x1 = Math.Min(src.Width, (int)Math.Ceiling((visible.Right - _dest.X) / d) + 2);
+        int y1 = Math.Min(src.Height, (int)Math.Ceiling((visible.Bottom - _dest.Y) / d) + 2);
+        if (x1 <= x0 || y1 <= y0) return;
+        var piece = new Rectangle(src.X + x0, src.Y + y0, x1 - x0, y1 - y0);
+
+        var key = (_version, _cropMode ? RotateFlipType.RotateNoneFlipNone : _rotate, src, piece, k, _resample);
+        if (_piece == null || _pieceKey != key)
+        {
+            var target = new Size(Math.Max(1, (int)Math.Round(piece.Width * k)), Math.Max(1, (int)Math.Round(piece.Height * k)));
+            byte[] px;
+            using (var part = image.Clone(piece, image.PixelFormat)) px = FrameOps.FromBitmap(part);
+            _piece?.Dispose();
+            _piece = FrameOps.ToBitmap(FrameOps.Scale(px, piece.Size, target, _resample), target);
+            _pieceKey = key;
+        }
+        g.InterpolationMode = InterpolationMode.NearestNeighbor;
+        g.PixelOffsetMode = PixelOffsetMode.Half;
+        g.DrawImage(_piece, new RectangleF(_dest.X + x0 * d, _dest.Y + y0 * d, piece.Width * d, piece.Height * d));
+    }
+
     // ───────────── Zoom & pan ─────────────
 
     float _zoom; // 0 = fit
@@ -182,7 +235,8 @@ sealed class EditorCanvas : Control
         if (_frame == null) return SizeF.Empty;
         var src = _cropMode || _crop.IsEmpty ? FrameRect : _crop;
         bool swap = !_cropMode && ExportOptions.SwapsAxes(_rotate);
-        return swap ? new SizeF(src.Height, src.Width) : new SizeF(src.Width, src.Height);
+        float k = _cropMode ? 1 : _outputScale;
+        return swap ? new SizeF(src.Height * k, src.Width * k) : new SizeF(src.Width * k, src.Height * k);
     }
 
     protected override void OnMouseWheel(MouseEventArgs e)
@@ -208,16 +262,25 @@ sealed class EditorCanvas : Control
         Image image = rotated ? RotatedView() : _frame;
         var src = rotated ? new Rectangle(0, 0, image.Width, image.Height) : _cropMode || _crop.IsEmpty ? FrameRect : _crop;
 
+        // _scale is screen pixels per output pixel; outside crop mode the output is the source times OutputScale.
+        float k = _cropMode ? 1 : _outputScale;
         var area = RectangleF.Inflate(ClientRectangle, -20 * s, -20 * s);
-        float fit = Math.Min(area.Width / src.Width, area.Height / src.Height);
+        float fit = Math.Min(area.Width / (src.Width * k), area.Height / (src.Height * k));
         _scale = _zoom > 0 ? _zoom : fit;
-        float w = src.Width * _scale, h = src.Height * _scale;
+        float w = src.Width * k * _scale, h = src.Height * k * _scale;
         var offset = _zoom > 0 ? _pan : PointF.Empty;
         _dest = new RectangleF((Width - w) / 2 + offset.X, (Height - h) / 2 + offset.Y, w, h);
 
-        g.InterpolationMode = Playing ? InterpolationMode.Bilinear : (_scale >= 1 ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBicubic);
-        g.PixelOffsetMode = PixelOffsetMode.Half;
-        g.DrawImage(image, _dest, src, GraphicsUnit.Pixel);
+        if (k != 1 && !Playing && _scale >= 1)
+            DrawOutputPiece(g, (Bitmap)image, src, k);
+        else
+        {
+            // Output pixels are smaller than screen pixels here (or playback needs speed): drawing the source directly looks the same.
+            bool smooth = _scale * k < 1 || (k > 1 && _resample == ResampleMode.Smooth);
+            g.InterpolationMode = Playing ? InterpolationMode.Bilinear : smooth ? InterpolationMode.HighQualityBicubic : InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(image, _dest, src, GraphicsUnit.Pixel);
+        }
         g.PixelOffsetMode = PixelOffsetMode.Default;
 
         // Thin outline separates the frame from the dark backdrop, which matters for dark content.
@@ -397,6 +460,7 @@ sealed class EditorCanvas : Control
             _toastFont.Dispose();
             _toastTimer.Dispose();
             _rotated?.Dispose();
+            _piece?.Dispose();
         }
         base.Dispose(disposing);
     }

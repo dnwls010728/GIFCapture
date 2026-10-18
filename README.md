@@ -46,6 +46,7 @@ All versions are on the [Releases](https://github.com/dnwls010728/GIFCapture/rel
 **Export**
 - One-click use-case presets: **Docs**, **Social** (≤ 1280 px wide), **Game** (high quality, 30 fps)
 - Quality, image size, max FPS, merge near-identical frames, loop count (forever or N times)
+- **Upscaled export**: image size up to 600%, with ×2–×6 buttons or any value on the slider. Choose how pixels are enlarged: **Sharp** (crisp blocks), **Smooth** (bicubic) or **Smart** (Scale2x/3x, smooths jagged diagonals); the preview shows the result
 - **Live file size estimate** and **fit to a target size** (e.g. 15 MB) automatically
 - Small files by design: only the changed part of each frame is stored
 - Save straight to a folder, copy the file to the clipboard for **Ctrl+V** into chats, or export a **PNG sequence** with a timing CSV for game engines
@@ -115,7 +116,8 @@ The editor opens with every frame on the timeline. Select frames by clicking, Sh
 **Edit** tab to trim, delete, change timing, add a caption, crop or rotate. Every change can be undone with **Ctrl+Z**.
 
 ### 5. Export
-On the **Export** tab, pick a use-case preset or set quality, size and FPS yourself. The estimated file size updates as you
+On the **Export** tab, pick a use-case preset or set quality, size and FPS yourself. Sizes above 100% enlarge the output
+(**×2–×6** buttons), with a choice of **Sharp / Smooth / Smart** enlargement. The estimated file size updates as you
 change settings; set a **Target size** and click **Fit to size** to let the app find settings that fit. Choose the file
 name and click **Save GIF** (**Ctrl+S**). The file is copied to the clipboard so you can paste it straight into a chat.
 

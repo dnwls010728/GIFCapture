@@ -89,7 +89,10 @@ sealed class EditorForm : Form
 
     readonly Segmented _preset = new() { Values = [0, 1, 2, 3], Labels = [L.T("직접"), L.T("문서용"), L.T("SNS용"), L.T("게임용")] };
     readonly ThemedSlider _quality = new() { Text = L.T("화질"), Minimum = 10, Maximum = 100, Step = 5, Suffix = "%" };
-    readonly ThemedSlider _scale = new() { Text = L.T("이미지 크기"), Minimum = 10, Maximum = 100, Step = 5, Suffix = "%" };
+    readonly ThemedSlider _scale = new() { Text = L.T("이미지 크기"), Minimum = 10, Maximum = 600, Step = 5, Suffix = "%",
+        Describe = v => v > 100 ? $"×{v / 100.0:0.##}" : "" };
+    readonly Segmented _scalePreset = new() { Values = [100, 200, 300, 400, 500, 600], Labels = ["×1", "×2", "×3", "×4", "×5", "×6"] };
+    readonly Segmented _resample = new() { Values = [0, 1, 2], Labels = [L.T("픽셀 그대로"), L.T("부드럽게"), L.T("픽셀 보정")] };
     readonly ToggleSwitch _limitFps = new() { Text = L.T("초당 프레임 제한") };
     readonly NumberStepper _maxFps = new() { Minimum = 1, Maximum = 50, Suffix = "fps" };
     readonly ToggleSwitch _merge = new() { Text = L.T("비슷한 프레임 합치기") };
@@ -130,6 +133,9 @@ sealed class EditorForm : Form
         _applyingPreset = true;
         _quality.Value = _settings.Quality;
         _scale.Value = _settings.ScalePercent;
+        _scalePreset.ShowValue(_scale.Value);
+        _resample.Value = (int)_settings.Resample;
+        _resample.Enabled = _scale.Value > 100;
         _limitFps.Checked = _settings.LimitFps;
         _maxFps.Value = _settings.MaxFps;
         _maxFps.Enabled = _limitFps.Checked;
@@ -144,6 +150,8 @@ sealed class EditorForm : Form
         WireEvents();
 
         _canvas.Frame = _view;
+        _canvas.OutputScale = _scale.Value / 100f;
+        _canvas.Resample = (ResampleMode)_resample.Value;
         _timeline.Aspect = (float)_srcSize.Width / _srcSize.Height;
         _timeline.ThumbnailFor = ThumbnailAt;
         _timeline.DelayFor = i => _frames[i].DelayMs;
@@ -238,25 +246,28 @@ sealed class EditorForm : Form
         xp.Controls.Add(_preset);
         _quality.Bounds = new Rectangle(L0, 74, Full, 50);
         _scale.Bounds = new Rectangle(L0, 128, Full, 50);
-        _limitFps.Bounds = new Rectangle(L0, 186, 150, 34);
-        _maxFps.Bounds = new Rectangle(L0 + 152, 186, Full - 152, 34);
-        _merge.Bounds = new Rectangle(L0, 226, Full, 30);
-        var playLabel = Theme.MutedLabel(L.T("반복"), new Rectangle(L0, 262, 90, 34));
-        _playCount.Bounds = new Rectangle(L0 + 92, 262, Full - 92, 34);
-        xp.Controls.AddRange([_quality, _scale, _limitFps, _maxFps, _merge, playLabel, _playCount]);
+        _scalePreset.Bounds = new Rectangle(L0, 182, Full, 32);
+        _resample.Bounds = new Rectangle(L0, 220, Full, 32);
+        _limitFps.Bounds = new Rectangle(L0, 264, 150, 34);
+        _maxFps.Bounds = new Rectangle(L0 + 152, 264, Full - 152, 34);
+        _merge.Bounds = new Rectangle(L0, 304, Full, 30);
+        var playLabel = Theme.MutedLabel(L.T("반복"), new Rectangle(L0, 340, 90, 34));
+        _playCount.Bounds = new Rectangle(L0 + 92, 340, Full - 92, 34);
+        xp.Controls.AddRange([_quality, _scale, _scalePreset, _resample, _limitFps, _maxFps, _merge, playLabel, _playCount]);
 
-        xp.Controls.Add(Theme.SectionLabel(L.T("목표 용량"), new Rectangle(L0 - 1, 308, Full, 24)));
-        _targetMb.Bounds = new Rectangle(L0, 334, 104, 36);
-        _fitBtnSize.Bounds = new Rectangle(L0 + 112, 334, Full - 112, 36);
+        xp.Controls.Add(Theme.SectionLabel(L.T("목표 용량"), new Rectangle(L0 - 1, 386, Full, 24)));
+        _targetMb.Bounds = new Rectangle(L0, 412, 104, 36);
+        _fitBtnSize.Bounds = new Rectangle(L0 + 112, 412, Full - 112, 36);
         xp.Controls.AddRange([_targetMb, _fitBtnSize]);
 
-        xp.Controls.Add(Theme.SectionLabel(L.T("저장"), new Rectangle(L0 - 1, 384, Full, 24)));
-        _format.Bounds = new Rectangle(L0, 410, Full, 34);
-        _folderLabel.Bounds = new Rectangle(L0, 450, Full, 22);
+        xp.Controls.Add(Theme.SectionLabel(L.T("저장"), new Rectangle(L0 - 1, 462, Full, 24)));
+        _format.Bounds = new Rectangle(L0, 488, Full, 34);
+        _folderLabel.Bounds = new Rectangle(L0, 528, Full - 96, 34);
+        _folderBtn.Bounds = new Rectangle(L0 + Full - 90, 528, 90, 34);
         Theme.StyleTextBox(_nameBox);
-        _nameBox.Bounds = new Rectangle(L0, 476, Full - 44, 30);
-        _extLabel.Bounds = new Rectangle(L0 + Full - 42, 476, 42, 30);
-        Place(xp, _folderBtn, L0, 514, W);
+        _nameBox.Bounds = new Rectangle(L0, 568, Full - 44, 30);
+        _extLabel.Bounds = new Rectangle(L0 + Full - 42, 568, 42, 30);
+        xp.Controls.Add(_folderBtn);
         xp.Controls.AddRange([_format, _folderLabel, _nameBox, _extLabel]);
 
         // Pinned save area
@@ -303,6 +314,8 @@ sealed class EditorForm : Form
         _tips.SetToolTip(_preset, L.T("문서용: 작은 용량 · 10fps\nSNS용: 가로 1280px 이하 · 15fps\n게임용: 높은 화질 · 30fps"));
         _tips.SetToolTip(_quality, L.T("낮추면 색 수를 줄이고 미세한 변화를 무시해 용량이 줄어듭니다."));
         _tips.SetToolTip(_scale, L.T("내보낼 GIF의 가로·세로 비율. 줄이면 용량이 크게 줄어듭니다."));
+        _tips.SetToolTip(_scalePreset, L.T("배율로 확대합니다. 미리보기에서 Ctrl+1로 실제 크기를 확인하세요."));
+        _tips.SetToolTip(_resample, L.T("확대할 때 픽셀을 그리는 방식.\n픽셀 그대로: 각 픽셀을 선명한 사각형으로\n부드럽게: 경계를 흐리게 보간\n픽셀 보정: 사각형을 유지하되 계단진 대각선을 다듬음"));
         _tips.SetToolTip(_limitFps, L.T("초당 프레임 수를 제한해 용량을 줄입니다. 재생 시간은 그대로."));
         _tips.SetToolTip(_merge, L.T("거의 똑같은 연속 프레임을 하나로 합칩니다. 재생 시간은 그대로."));
         _tips.SetToolTip(_playCount, L.T("GIF가 재생되는 횟수. 0이면 무한 반복."));
@@ -311,6 +324,13 @@ sealed class EditorForm : Form
         _tips.SetToolTip(_folderBtn, L.T("저장할 폴더를 고릅니다."));
         _tips.SetToolTip(_copyBtn, L.T("저장한 파일을 클립보드에 복사 (Ctrl+Shift+C). 메신저에 Ctrl+V로 붙여넣기."));
         _tips.SetToolTip(_exportBtn, L.T("저장 위치에 바로 저장 (Ctrl+S)"));
+    }
+
+    /// <summary>Keeps the whole output in view while the user tunes enlargement, so the preview does not jump around.</summary>
+    void FitPreview()
+    {
+        if (_applyingPreset || _canvas.CropMode || _canvas.IsFit) return;
+        _canvas.ZoomToFit();
     }
 
     static void Place(Control parent, Control c, int x, int y, int w)
@@ -366,7 +386,15 @@ sealed class EditorForm : Form
 
         _preset.ValueChanged += (_, _) => ApplyExportPreset(_preset.Value);
         _quality.ValueChanged += (_, _) => OptionsChanged();
-        _scale.ValueChanged += (_, _) => OptionsChanged();
+        _scale.ValueChanged += (_, _) =>
+        {
+            _scalePreset.ShowValue(_scale.Value);
+            _resample.Enabled = _scale.Value > 100;
+            OptionsChanged();
+            FitPreview();
+        };
+        _scalePreset.ValueChanged += (_, _) => { if (_scalePreset.Value != 0) _scale.Value = _scalePreset.Value; };
+        _resample.ValueChanged += (_, _) => { OptionsChanged(keepPreset: true); FitPreview(); };
         _limitFps.CheckedChanged += (_, _) => { _maxFps.Enabled = _limitFps.Checked; OptionsChanged(); };
         _maxFps.ValueChanged += (_, _) => OptionsChanged();
         _merge.CheckedChanged += (_, _) => OptionsChanged();
@@ -534,7 +562,7 @@ sealed class EditorForm : Form
 
     ExportOptions CurrentOptions(Rectangle? crop = null) => new(
         crop ?? _crop, RotateType, _scale.Value, _quality.Value,
-        _limitFps.Checked ? _maxFps.Value : 0, _merge.Checked, _playCount.Value);
+        _limitFps.Checked ? _maxFps.Value : 0, _merge.Checked, _playCount.Value, (ResampleMode)_resample.Value);
 
     /// <summary>Bottom-of-sidebar summary: output size, length and estimated file size.</summary>
     void UpdateSummary()
@@ -562,6 +590,9 @@ sealed class EditorForm : Form
         _dirty = true;
         _settings.Quality = _quality.Value;
         _settings.ScalePercent = _scale.Value;
+        _settings.Resample = (ResampleMode)_resample.Value;
+        _canvas.OutputScale = _scale.Value / 100f;
+        _canvas.Resample = (ResampleMode)_resample.Value;
         _settings.LimitFps = _limitFps.Checked;
         _settings.MaxFps = _maxFps.Value;
         _settings.MergeSimilar = _merge.Checked;
@@ -659,7 +690,7 @@ sealed class EditorForm : Form
         var steps = new List<(int Q, int S)> { (q0, s0) };
         foreach (var q in new[] { 70, 50 }) if (q < q0) steps.Add((q, s0));
         int qLow = Math.Min(q0, 50);
-        foreach (var s in new[] { 90, 75, 60, 50, 40, 30, 25 }) if (s < s0) steps.Add((qLow, s));
+        foreach (var s in new[] { 500, 400, 300, 200, 100, 90, 75, 60, 50, 40, 30, 25 }) if (s < s0) steps.Add((qLow, s));
         steps.Add((Math.Min(qLow, 35), Math.Min(s0, 25)));
         steps.Add((Math.Min(qLow, 20), Math.Min(s0, 20)));
 

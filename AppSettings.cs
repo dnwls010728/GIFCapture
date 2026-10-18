@@ -28,6 +28,7 @@ sealed class AppSettings
     public string SaveFolder { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "GifCapture");
     public int Quality { get; set; } = 90;
     public int ScalePercent { get; set; } = 100;
+    public ResampleMode Resample { get; set; }
     public bool LimitFps { get; set; }
     public int MaxFps { get; set; } = 15;
     public bool MergeSimilar { get; set; } = true;

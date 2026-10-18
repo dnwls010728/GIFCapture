@@ -793,7 +793,7 @@ sealed class MainForm : Form
         var frames = delays.Select((d, i) => new EditFrame(i, Math.Max(10, d))).ToList();
         var s = _settings;
         var options = new ExportOptions(Rectangle.Empty, RotateFlipType.RotateNoneFlipNone, s.ScalePercent, s.Quality,
-            s.LimitFps ? s.MaxFps : 0, s.MergeSimilar, s.PlayCount);
+            s.LimitFps ? s.MaxFps : 0, s.MergeSimilar, s.PlayCount, s.Resample);
         var progress = new Progress<float>(p => _statusSub.Text = $"{p * 100:0}%");
         SetStatus(L.T("저장 중…"), "0%", Theme.Text);
         try
