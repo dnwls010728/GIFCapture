@@ -8,8 +8,6 @@ namespace GifCapture;
 /// </summary>
 sealed class GifEncoder
 {
-    const byte TransparentIndex = 255;
-
     readonly Stream _s;
     readonly int _w, _h;
     readonly int _maxColors, _tolerance;
@@ -60,7 +58,7 @@ sealed class GifEncoder
         if (_shown == null)
         {
             var palette = _quantizer.Quantize(bgra, null, _w * _h, _indices, _maxColors);
-            WriteFrame(new Rectangle(0, 0, _w, _h), palette, delayCs, transparent: false);
+            WriteFrame(new Rectangle(0, 0, _w, _h), palette, _quantizer.ColorCount, delayCs, transparentIndex: -1);
             _shown = (byte[])bgra.Clone();
             return;
         }
@@ -85,10 +83,14 @@ sealed class GifEncoder
         }
 
         var pal = _quantizer.Quantize(_sub, _mask, n, _indices, Math.Min(_maxColors, 255));
-        for (int i = 0; i < n; i++)
-            if (!_mask[i]) _indices[i] = TransparentIndex;
 
-        WriteFrame(box, pal, delayCs, transparent: true);
+        // The transparent entry takes the last slot of the power-of-two table, which no palette color occupies
+        int entries = _quantizer.ColorCount + 1;
+        int transparent = (1 << TableBits(entries)) - 1;
+        for (int i = 0; i < n; i++)
+            if (!_mask[i]) _indices[i] = (byte)transparent;
+
+        WriteFrame(box, pal, entries, delayCs, transparent);
     }
 
     bool Differs(uint a, uint b)
@@ -124,24 +126,31 @@ sealed class GifEncoder
         return minY < 0 ? Rectangle.Empty : Rectangle.FromLTRB(minX, minY, maxX + 1, maxY + 1);
     }
 
-    void WriteFrame(Rectangle box, byte[] palette, int delayCs, bool transparent)
+    /// <summary>Smallest color table exponent (table size = 1 &lt;&lt; result) holding <paramref name="entries"/> colors; never below 2 entries.</summary>
+    static int TableBits(int entries) => Math.Max(1, 32 - System.Numerics.BitOperations.LeadingZeroCount((uint)(entries - 1)));
+
+    /// <param name="transparentIndex">Palette slot used for unchanged pixels, or -1 for an opaque frame.</param>
+    void WriteFrame(Rectangle box, byte[] palette, int entries, int delayCs, int transparentIndex)
     {
+        bool transparent = transparentIndex >= 0;
+
         // Graphic control extension; disposal 1 = keep previous frame underneath
         _s.Write([0x21, 0xF9, 0x04, (byte)(0x04 | (transparent ? 0x01 : 0x00))]);
         WriteShort(Math.Clamp(delayCs, 2, 65535));
-        _s.WriteByte(transparent ? TransparentIndex : (byte)0);
+        _s.WriteByte(transparent ? (byte)transparentIndex : (byte)0);
         _s.WriteByte(0x00);
 
-        // Image descriptor with 256-entry local color table
+        // Image descriptor with a local color table sized to the entries actually used
+        int bits = TableBits(entries);
         _s.WriteByte(0x2C);
         WriteShort(box.X);
         WriteShort(box.Y);
         WriteShort(box.Width);
         WriteShort(box.Height);
-        _s.WriteByte(0x87);
-        _s.Write(palette);
+        _s.WriteByte((byte)(0x80 | (bits - 1)));
+        _s.Write(palette, 0, 3 << bits);
 
-        _lzw.Encode(_s, _indices.AsSpan(0, box.Width * box.Height));
+        _lzw.Encode(_s, _indices.AsSpan(0, box.Width * box.Height), Math.Max(2, bits));
     }
 
     public void Finish()
@@ -168,17 +177,17 @@ sealed class Quantizer
     const int Bits = 6;
     const int Size = 1 << (Bits * 3);
 
-    readonly int[] _count = new int[Size];
-    readonly long[] _sumR = new long[Size], _sumG = new long[Size], _sumB = new long[Size];
+    // Per-histogram-cell accumulator; only cells listed in _keys are non-zero between calls.
+    struct Bin
+    {
+        public int Count;
+        public long R, G, B;
+    }
+
+    readonly Bin[] _bins = new Bin[Size];
     readonly int[] _keys = new int[Size];
     readonly byte[] _map = new byte[Size];
     readonly byte[] _palette = new byte[256 * 3];
-    static readonly IComparer<int>[] AxisComparers =
-    [
-        Comparer<int>.Create((a, b) => Channel(a, 0) - Channel(b, 0)),
-        Comparer<int>.Create((a, b) => Channel(a, 1) - Channel(b, 1)),
-        Comparer<int>.Create((a, b) => Channel(a, 2) - Channel(b, 2)),
-    ];
 
     struct Box
     {
@@ -186,33 +195,44 @@ sealed class Quantizer
         public long Score;
     }
 
+    /// <summary>Number of palette entries produced by the last <see cref="Quantize"/> call.</summary>
+    public int ColorCount { get; private set; }
+
     static int Key(byte r, byte g, byte b) => ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
 
     static int Channel(int key, int axis) => (key >> (12 - axis * 6)) & 63;
 
+    // Moves the given channel into the top bits so a plain integer sort orders by it (ties fall back to the other channels).
+    static int ToSortKey(int key, int axis) =>
+        (Channel(key, axis) << 12) | (Channel(key, axis == 0 ? 1 : 0) << 6) | Channel(key, axis == 2 ? 1 : 2);
+
+    static int FromSortKey(int sortKey, int axis)
+    {
+        int hi = sortKey >> 12, mid = (sortKey >> 6) & 63, lo = sortKey & 63;
+        return axis switch
+        {
+            0 => sortKey,
+            1 => (mid << 12) | (hi << 6) | lo,
+            _ => (mid << 12) | (lo << 6) | hi,
+        };
+    }
+
     /// <param name="mask">When given, only pixels whose mask entry is true shape the palette.</param>
-    /// <returns>The 768-byte RGB palette; <paramref name="indices"/> receives one palette index per pixel.</returns>
+    /// <returns>The RGB palette (<see cref="ColorCount"/> entries used); <paramref name="indices"/> receives one palette index per pixel.</returns>
     public byte[] Quantize(byte[] bgra, bool[]? mask, int pixelCount, byte[] indices, int maxColors)
     {
-        Array.Clear(_count);
-        Array.Clear(_sumR);
-        Array.Clear(_sumG);
-        Array.Clear(_sumB);
-
+        int n = 0;
         for (int p = 0, i = 0; p < pixelCount; p++, i += 4)
         {
             if (mask != null && !mask[p]) continue;
             byte b = bgra[i], g = bgra[i + 1], r = bgra[i + 2];
             int k = Key(r, g, b);
-            _count[k]++;
-            _sumR[k] += r;
-            _sumG[k] += g;
-            _sumB[k] += b;
+            ref var bin = ref _bins[k];
+            if (bin.Count++ == 0) _keys[n++] = k;
+            bin.R += r;
+            bin.G += g;
+            bin.B += b;
         }
-
-        int n = 0;
-        for (int k = 0; k < Size; k++)
-            if (_count[k] != 0) _keys[n++] = k;
 
         var boxes = new List<Box>(maxColors) { MakeBox(0, n) };
         while (boxes.Count < maxColors)
@@ -224,15 +244,18 @@ sealed class Quantizer
             if (best < 0) break;
 
             var box = boxes[best];
-            Array.Sort(_keys, box.Start, box.End - box.Start, AxisComparers[box.Axis]);
+            var run = _keys.AsSpan(box.Start, box.End - box.Start);
+            for (int i = 0; i < run.Length; i++) run[i] = ToSortKey(run[i], box.Axis);
+            run.Sort();
+            for (int i = 0; i < run.Length; i++) run[i] = FromSortKey(run[i], box.Axis);
 
             long pop = 0;
-            for (int i = box.Start; i < box.End; i++) pop += _count[_keys[i]];
+            for (int i = box.Start; i < box.End; i++) pop += _bins[_keys[i]].Count;
             long cum = 0;
             int mid = box.End - 1;
             for (int i = box.Start; i < box.End; i++)
             {
-                cum += _count[_keys[i]];
+                cum += _bins[_keys[i]].Count;
                 if (cum * 2 >= pop) { mid = i + 1; break; }
             }
             mid = Math.Clamp(mid, box.Start + 1, box.End - 1);
@@ -248,10 +271,11 @@ sealed class Quantizer
             for (int i = boxes[bi].Start; i < boxes[bi].End; i++)
             {
                 int k = _keys[i];
-                c += _count[k];
-                r += _sumR[k];
-                g += _sumG[k];
-                b += _sumB[k];
+                ref var bin = ref _bins[k];
+                c += bin.Count;
+                r += bin.R;
+                g += bin.G;
+                b += bin.B;
                 _map[k] = (byte)bi;
             }
             if (c == 0) continue;
@@ -263,6 +287,8 @@ sealed class Quantizer
         for (int i = 0, p = 0; p < pixelCount; i += 4, p++)
             indices[p] = mask == null || mask[p] ? _map[Key(bgra[i + 2], bgra[i + 1], bgra[i])] : (byte)0;
 
+        for (int i = 0; i < n; i++) _bins[_keys[i]] = default; // reset only the touched cells
+        ColorCount = boxes.Count;
         return _palette;
     }
 
@@ -277,7 +303,7 @@ sealed class Quantizer
         for (int i = start; i < end; i++)
         {
             int k = _keys[i];
-            pop += _count[k];
+            pop += _bins[k].Count;
             for (int a = 0; a < 3; a++)
             {
                 int v = Channel(k, a);
@@ -300,61 +326,73 @@ sealed class Quantizer
     }
 }
 
-/// <summary>GIF-flavored variable-width LZW with 8-bit roots.</summary>
+/// <summary>GIF-flavored variable-width LZW.</summary>
 sealed class LzwEncoder
 {
     const int MaxCodes = 4096;
-    const int ClearCode = 256;
-    const int EndCode = 257;
+    const int TableBits = 13; // 8192 slots keep the load factor at or below 0.5 with 4096 codes
+    const int TableMask = (1 << TableBits) - 1;
 
-    // Dictionary indexed by (prefix << 8 | byte); an entry is valid when its stamp matches _generation.
-    readonly int[] _codes = new int[MaxCodes * 256];
-    readonly int[] _stamps = new int[MaxCodes * 256];
-    int _generation;
+    // Open-addressing dictionary. Entry = generation << 32 | (prefix << 8 | byte) << 12 | code; stale generations read as empty.
+    readonly ulong[] _table = new ulong[1 << TableBits];
+    uint _generation;
 
     readonly byte[] _block = new byte[255];
     int _blockLen;
-    int _bitBuf, _bitCount, _codeSize;
+    int _bitBuf, _bitCount, _codeSize, _minCodeSize;
     Stream _s = Stream.Null;
 
-    public void Encode(Stream s, ReadOnlySpan<byte> pixels)
+    public void Encode(Stream s, ReadOnlySpan<byte> pixels, int minCodeSize)
     {
         _s = s;
         _blockLen = _bitBuf = _bitCount = 0;
-        s.WriteByte(8); // minimum code size
+        _minCodeSize = minCodeSize;
+        int clearCode = 1 << minCodeSize;
+        int endCode = clearCode + 1;
+        s.WriteByte((byte)minCodeSize);
 
         int next = Reset();
-        Emit(ClearCode);
+        Emit(clearCode);
 
         int prefix = pixels[0];
         for (int i = 1; i < pixels.Length; i++)
         {
             int px = pixels[i];
-            int slot = (prefix << 8) | px;
-            if (_stamps[slot] == _generation)
+            uint key = (uint)((prefix << 8) | px);
+            ulong stamp = (ulong)_generation << 32;
+            int slot = (int)((key * 2654435761u) >> (32 - TableBits));
+            bool found = false;
+            while (true)
             {
-                prefix = _codes[slot];
-                continue;
+                ulong e = _table[slot];
+                if ((e & 0xFFFFFFFF00000000UL) != stamp) break;
+                if ((uint)e >> 12 == key)
+                {
+                    prefix = (int)(e & 0xFFF);
+                    found = true;
+                    break;
+                }
+                slot = (slot + 1) & TableMask;
             }
+            if (found) continue;
 
             Emit(prefix);
             if (next < MaxCodes)
             {
-                _codes[slot] = next;
-                _stamps[slot] = _generation;
+                _table[slot] = stamp | ((ulong)key << 12) | (uint)next;
                 next++;
                 if (next > (1 << _codeSize) && _codeSize < 12) _codeSize++;
             }
             else
             {
-                Emit(ClearCode);
+                Emit(clearCode);
                 next = Reset();
             }
             prefix = px;
         }
 
         Emit(prefix);
-        Emit(EndCode);
+        Emit(endCode);
         if (_bitCount > 0) PutByte((byte)_bitBuf);
         FlushBlock();
         s.WriteByte(0); // block terminator
@@ -363,8 +401,8 @@ sealed class LzwEncoder
     int Reset()
     {
         _generation++;
-        _codeSize = 9;
-        return EndCode + 1;
+        _codeSize = _minCodeSize + 1;
+        return (1 << _minCodeSize) + 2;
     }
 
     void Emit(int code)

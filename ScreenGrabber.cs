@@ -33,8 +33,9 @@ sealed class ScreenGrabber : IDisposable
         _oldBitmap = Native.SelectObject(_memDc, _bitmap);
     }
 
-    /// <returns>BGRA pixels of the block whose top-left is <paramref name="origin"/>.</returns>
-    public byte[] Grab(Point origin, bool drawCursor, InputOverlay? overlay = null)
+    /// <summary>Copies the BGRA pixels of the block whose top-left is <paramref name="origin"/> into <paramref name="dest"/>.</summary>
+    /// <param name="dest">Caller-owned buffer of at least width × height × 4 bytes.</param>
+    public void Grab(Point origin, bool drawCursor, byte[] dest, InputOverlay? overlay = null)
     {
         if (!Native.BitBlt(_memDc, 0, 0, _w, _h, _screenDc, origin.X, origin.Y, Native.SRCCOPY))
             throw new InvalidOperationException(L.F("화면 복사 실패 (Win32 오류 {0}).", Marshal.GetLastPInvokeError()));
@@ -46,9 +47,7 @@ sealed class ScreenGrabber : IDisposable
         if (drawCursor) Native.DrawCursor(_memDc, origin);
         Native.GdiFlush();
 
-        var buf = new byte[_w * _h * 4];
-        Marshal.Copy(_bits, buf, 0, buf.Length);
-        return buf;
+        Marshal.Copy(_bits, dest, 0, _w * _h * 4);
     }
 
     public void Dispose()

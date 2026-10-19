@@ -14,14 +14,21 @@ sealed class Recorder
     readonly int _fps;
     readonly bool _drawCursor;
     readonly InputOverlay? _overlay;
-    readonly BlockingCollection<Frame> _queue = new();
+    const int QueueCapacity = 8;
+    const int PreviewIntervalMs = 100;
+
+    readonly BlockingCollection<Frame> _queue = new(QueueCapacity);
+    readonly ConcurrentQueue<byte[]> _pool = new();
+    readonly object _previewLock = new();
     readonly Stopwatch _clock = new();
     readonly object _regionLock = new();
     readonly List<int> _delays = [];
     Rectangle _region;
     Thread? _captureThread, _storeThread;
     volatile bool _stopRequested;
-    volatile byte[]? _latest;
+    byte[]? _previewBuf, _previewCopy;
+    long _previewMs = -PreviewIntervalMs;
+    bool _previewDirty;
     long _endMs;
     int _captured;
 
@@ -32,8 +39,25 @@ sealed class Recorder
     public int CapturedFrames => _captured;
     public TimeSpan Elapsed => _clock.Elapsed;
     public Size FrameSize => _size;
-    /// <summary>Most recently captured pixels (BGRA, <see cref="FrameSize"/>), for live preview.</summary>
-    public byte[]? LatestFrame => _latest;
+    /// <summary>
+    /// Recent captured pixels (BGRA, <see cref="FrameSize"/>) for live preview, refreshed about every 100 ms.
+    /// A private copy that stays valid; the same instance is returned until a newer frame is available.
+    /// </summary>
+    public byte[]? LatestFrame
+    {
+        get
+        {
+            lock (_previewLock)
+            {
+                if (_previewDirty && _previewBuf != null)
+                {
+                    _previewCopy = (byte[])_previewBuf.Clone();
+                    _previewDirty = false;
+                }
+                return _previewCopy;
+            }
+        }
+    }
 
     /// <summary>Region currently being captured, in screen coordinates. Moves when following a window.</summary>
     public Rectangle CurrentRegion
@@ -92,10 +116,18 @@ sealed class Recorder
                 long now = _clock.ElapsedMilliseconds;
                 if (UpdateTrackedRegion())
                 {
-                    var pixels = grabber.Grab(CurrentRegion.Location, _drawCursor, _overlay);
-                    _latest = pixels;
-                    _queue.Add(new Frame(pixels, now));
-                    _captured++;
+                    // Store thread is behind: skip this tick. The previous stored frame then simply lasts until the next
+                    // stored one, since delays come from the timestamps of stored frames.
+                    if (_queue.Count < QueueCapacity)
+                    {
+                        var pixels = Rent();
+                        grabber.Grab(CurrentRegion.Location, _drawCursor, pixels, _overlay);
+                        UpdatePreview(pixels, now);
+                        if (_queue.TryAdd(new Frame(pixels, now)))
+                            _captured++;
+                        else
+                            Return(pixels);
+                    }
                 }
 
                 tick++;
@@ -116,6 +148,27 @@ sealed class Recorder
             _clock.Stop();
             Native.timeEndPeriod(1);
             _queue.CompleteAdding();
+            _overlay?.Dispose(); // this thread is its only user
+        }
+    }
+
+    byte[] Rent() => _pool.TryDequeue(out var buf) ? buf : new byte[_size.Width * _size.Height * 4];
+
+    /// <summary>Keeps roughly the queue plus in-flight buffers; extras are left to the GC.</summary>
+    void Return(byte[] buf)
+    {
+        if (_pool.Count < QueueCapacity + 4) _pool.Enqueue(buf);
+    }
+
+    void UpdatePreview(byte[] pixels, long now)
+    {
+        if (now - _previewMs < PreviewIntervalMs) return;
+        _previewMs = now;
+        lock (_previewLock)
+        {
+            _previewBuf ??= new byte[pixels.Length];
+            Buffer.BlockCopy(pixels, 0, _previewBuf, 0, pixels.Length);
+            _previewDirty = true;
         }
     }
 
@@ -141,10 +194,14 @@ sealed class Recorder
             {
                 // Identical frames just extend the previous frame's duration.
                 if (prev != null && prev.AsSpan().SequenceEqual(frame.Pixels))
+                {
+                    Return(frame.Pixels);
                     continue;
+                }
                 if (prev != null)
                     _delays.Add((int)(frame.Ms - prevMs));
                 Frames.Append(frame.Pixels);
+                if (prev != null) Return(prev);
                 prev = frame.Pixels;
                 prevMs = frame.Ms;
             }

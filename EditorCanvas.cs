@@ -26,7 +26,8 @@ sealed class EditorCanvas : Control
 
     public EditorCanvas()
     {
-        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+        TabStop = false;
         BackColor = Color.FromArgb(0x0E, 0x0F, 0x12);
         _toastTimer.Tick += (_, _) =>
         {
@@ -170,11 +171,13 @@ sealed class EditorCanvas : Control
         var visible = RectangleF.Intersect(_dest, ClientRectangle);
         if (visible.IsEmpty) return;
         float d = _scale * k; // screen pixels per source pixel
-        // A small margin gives the filters real neighbours at the piece edges.
-        int x0 = Math.Max(0, (int)Math.Floor((visible.Left - _dest.X) / d) - 2);
-        int y0 = Math.Max(0, (int)Math.Floor((visible.Top - _dest.Y) / d) - 2);
-        int x1 = Math.Min(src.Width, (int)Math.Ceiling((visible.Right - _dest.X) / d) + 2);
-        int y1 = Math.Min(src.Height, (int)Math.Ceiling((visible.Bottom - _dest.Y) / d) + 2);
+        // A margin gives the filters real neighbours at the piece edges: Lanczos reaches 3 source pixels, the sharpening
+        // blur about 2 more, xBR 2.
+        const int margin = 6;
+        int x0 = Math.Max(0, (int)Math.Floor((visible.Left - _dest.X) / d) - margin);
+        int y0 = Math.Max(0, (int)Math.Floor((visible.Top - _dest.Y) / d) - margin);
+        int x1 = Math.Min(src.Width, (int)Math.Ceiling((visible.Right - _dest.X) / d) + margin);
+        int y1 = Math.Min(src.Height, (int)Math.Ceiling((visible.Bottom - _dest.Y) / d) + margin);
         if (x1 <= x0 || y1 <= y0) return;
         var piece = new Rectangle(src.X + x0, src.Y + y0, x1 - x0, y1 - y0);
 
@@ -271,13 +274,16 @@ sealed class EditorCanvas : Control
         var offset = _zoom > 0 ? _pan : PointF.Empty;
         _dest = new RectangleF((Width - w) / 2 + offset.X, (Height - h) / 2 + offset.Y, w, h);
 
-        if (k != 1 && !Playing && _scale >= 1)
+        // Playback goes through the same path as a paused frame, so the picture doesn't change when it starts moving.
+        // The piece covers at most the window, which keeps every resampler fast enough for each frame.
+        if (k != 1 && _scale >= 1)
             DrawOutputPiece(g, (Bitmap)image, src, k);
         else
         {
-            // Output pixels are smaller than screen pixels here (or playback needs speed): drawing the source directly looks the same.
-            bool smooth = _scale * k < 1 || (k > 1 && _resample == ResampleMode.Smooth);
-            g.InterpolationMode = Playing ? InterpolationMode.Bilinear : smooth ? InterpolationMode.HighQualityBicubic : InterpolationMode.NearestNeighbor;
+            // Output pixels are smaller than screen pixels here: drawing the source directly looks the same.
+            bool smooth = _scale * k < 1 || (k > 1 && _resample is ResampleMode.Smooth or ResampleMode.Crisp);
+            // Bilinear is the cheap stand-in for bicubic while playing; blocks stay blocks either way.
+            g.InterpolationMode = !smooth ? InterpolationMode.NearestNeighbor : Playing ? InterpolationMode.Bilinear : InterpolationMode.HighQualityBicubic;
             g.PixelOffsetMode = PixelOffsetMode.Half;
             g.DrawImage(image, _dest, src, GraphicsUnit.Pixel);
         }
@@ -287,9 +293,229 @@ sealed class EditorCanvas : Control
         using (var outline = new Pen(Color.FromArgb(0x30, 0x33, 0x3C)))
             g.DrawRectangle(outline, _dest.X - 1, _dest.Y - 1, _dest.Width + 1, _dest.Height + 1);
 
-        if (!_cropMode && !string.IsNullOrWhiteSpace(_caption)) GifCapture.Caption.Draw(g, _dest, _caption);
+        if (!_cropMode)
+        {
+            GifCapture.Decor.Draw(g, _dest, _liveDecor ?? _decor, _frameStickers, PreviewBitmap, disposeBitmaps: false);
+            if (!string.IsNullOrWhiteSpace(_caption)) GifCapture.Caption.Draw(g, _dest, _caption);
+            DrawDecorSelection(g, s);
+        }
         if (_cropMode) DrawCropOverlay(g, s);
         DrawToast(g, s);
+    }
+
+    // ───────────── Watermark & stickers ─────────────
+
+    enum DecorDrag { None, Move, Resize, Rotate }
+
+    DecorSet _decor = DecorSet.Empty;
+    DecorSet? _liveDecor; // the set as it looks mid-drag
+    int[]? _frameStickers;
+    int? _selectedSticker;
+    bool _watermarkSelected;
+    DecorDrag _decorDrag;
+    Point _decorStart;
+    RectangleF _decorStartRect;
+    Sticker? _decorStartSticker;
+    readonly Dictionary<int, (ImageAsset Asset, Size Size, Bitmap Bitmap)> _bitmaps = [];
+
+    /// <summary>A sticker, the watermark, or nothing was clicked: (sticker id, watermark).</summary>
+    public event Action<int?, bool>? DecorSelected;
+    /// <summary>A sticker was moved, resized or turned in the preview.</summary>
+    public event Action<Sticker>? StickerEdited;
+    /// <summary>The watermark was moved or resized in the preview.</summary>
+    public event Action<Watermark>? WatermarkEdited;
+
+    public DecorSet Decor
+    {
+        get => _decor;
+        set { _decor = value; Invalidate(); }
+    }
+
+    /// <summary>Stickers on the frame being shown.</summary>
+    public int[]? FrameStickers
+    {
+        get => _frameStickers;
+        set { if (_frameStickers == value) return; _frameStickers = value; Invalidate(); }
+    }
+
+    public int? SelectedSticker
+    {
+        get => _selectedSticker;
+        set { _selectedSticker = value; if (value != null) _watermarkSelected = false; Invalidate(); }
+    }
+
+    public bool WatermarkSelected
+    {
+        get => _watermarkSelected;
+        set { _watermarkSelected = value; if (value) _selectedSticker = null; Invalidate(); }
+    }
+
+    /// <summary>
+    /// Bitmap of an image at its drawn size, kept while neither changes. Never larger than the image itself: beyond
+    /// that, letting DrawImage stretch it looks the same and keeps memory bounded when zoomed in.
+    /// </summary>
+    Bitmap PreviewBitmap(int? id, ImageAsset asset, Size size)
+    {
+        if (size.Width > asset.Size.Width || size.Height > asset.Size.Height) size = asset.Size;
+        int key = id ?? -1;
+        if (_bitmaps.TryGetValue(key, out var c) && c.Asset == asset && c.Size == size) return c.Bitmap;
+        c.Bitmap?.Dispose();
+        var bmp = asset.Resize(size).CreateBitmap();
+        _bitmaps[key] = (asset, size, bmp);
+        return bmp;
+    }
+
+    RectangleF? StickerScreenRect(DecorSet d, int id) =>
+        d.Stickers.TryGetValue(id, out var s) && d.Images.TryGetValue(s.ImageId, out var a) ? GifCapture.Decor.StickerRect(s, a, _dest) : null;
+
+    RectangleF? WatermarkScreenRect(DecorSet d) => d.HasWatermark ? GifCapture.Decor.WatermarkRect(d.Watermark, d.WatermarkImage, _dest) : null;
+
+    RectangleF? SelectedRect(DecorSet d) =>
+        _watermarkSelected ? WatermarkScreenRect(d) : _selectedSticker is { } id && _frameStickers?.Contains(id) == true ? StickerScreenRect(d, id) : null;
+
+    /// <summary>Outline of the selection as drawn, turned with it: top-left, top-right, bottom-right, bottom-left.</summary>
+    PointF[]? SelectedCorners(DecorSet d)
+    {
+        if (SelectedRect(d) is not { } r) return null;
+        if (_watermarkSelected || !d.Stickers.TryGetValue(_selectedSticker!.Value, out var s) || !d.Images.TryGetValue(s.ImageId, out var a))
+            return [r.Location, new(r.Right, r.Top), new(r.Right, r.Bottom), new(r.Left, r.Bottom)];
+        return GifCapture.Decor.StickerCorners(s, a, _dest);
+    }
+
+    static PointF Mid(PointF a, PointF b) => new((a.X + b.X) / 2, (a.Y + b.Y) / 2);
+
+    static float Distance(PointF a, PointF b) => MathF.Sqrt((a.X - b.X) * (a.X - b.X) + (a.Y - b.Y) * (a.Y - b.Y));
+
+    /// <summary>Rotation knob: out from the middle of the top edge, away from the centre. Stickers only.</summary>
+    PointF? RotateHandle(PointF[] corners)
+    {
+        if (_watermarkSelected) return null;
+        var top = Mid(corners[0], corners[1]);
+        var center = Mid(corners[0], corners[2]);
+        float len = Math.Max(1, Distance(top, center)), reach = 26 * S;
+        return new PointF(top.X + (top.X - center.X) / len * reach, top.Y + (top.Y - center.Y) / len * reach);
+    }
+
+    void DrawDecorSelection(Graphics g, float s)
+    {
+        if (SelectedCorners(_liveDecor ?? _decor) is not { } c) return;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var dark = new Pen(Color.FromArgb(160, 0, 0, 0), 3 * s)) g.DrawPolygon(dark, c);
+        using (var pen = new Pen(Theme.AccentHover, 1.5f * s) { DashStyle = DashStyle.Dash }) g.DrawPolygon(pen, c);
+
+        float k = 10 * s;
+        using var outline = new Pen(Theme.AccentFill, 1.5f * s);
+        if (RotateHandle(c) is { } knob)
+        {
+            using (var stem = new Pen(Theme.AccentHover, 1.5f * s)) g.DrawLine(stem, Mid(c[0], c[1]), knob);
+            var dot = new RectangleF(knob.X - k * 0.6f, knob.Y - k * 0.6f, k * 1.2f, k * 1.2f);
+            g.FillEllipse(Brushes.White, dot);
+            g.DrawEllipse(outline, dot);
+        }
+        var h = new RectangleF(c[2].X - k / 2, c[2].Y - k / 2, k, k);
+        g.FillRectangle(Brushes.White, h);
+        g.DrawRectangle(outline, h.X, h.Y, h.Width, h.Height);
+    }
+
+    /// <summary>What sits under <paramref name="p"/>: the selection's handles first, then the topmost item.</summary>
+    (int? Sticker, bool Watermark, DecorDrag Part) HitDecor(Point p)
+    {
+        if (_cropMode || _frame == null) return (null, false, DecorDrag.None);
+        float reach = 8 * S;
+        if (SelectedCorners(_decor) is { } c)
+        {
+            if (RotateHandle(c) is { } knob && Distance(p, knob) <= reach) return (_selectedSticker, false, DecorDrag.Rotate);
+            if (Distance(p, c[2]) <= reach) return (_selectedSticker, _watermarkSelected, DecorDrag.Resize);
+        }
+        if (WatermarkScreenRect(_decor) is { } w && w.Contains(p)) return (null, true, DecorDrag.Move);
+        if (_frameStickers != null)
+            for (int i = _frameStickers.Length - 1; i >= 0; i--)
+                if (_decor.Stickers.TryGetValue(_frameStickers[i], out var s) && _decor.Images.TryGetValue(s.ImageId, out var a)
+                    && GifCapture.Decor.StickerContains(s, a, _dest, p))
+                    return (_frameStickers[i], false, DecorDrag.Move);
+        return (null, false, DecorDrag.None);
+    }
+
+    static Cursor DecorCursor(DecorDrag part) => part switch
+    {
+        DecorDrag.Move => Cursors.SizeAll,
+        DecorDrag.Resize => Cursors.SizeNWSE,
+        DecorDrag.Rotate => Cursors.Hand,
+        _ => Cursors.Default,
+    };
+
+    bool BeginDecorDrag(MouseEventArgs e)
+    {
+        var (sticker, watermark, part) = HitDecor(e.Location);
+        if (sticker != _selectedSticker || watermark != _watermarkSelected)
+        {
+            _selectedSticker = sticker;
+            _watermarkSelected = watermark;
+            Invalidate();
+            DecorSelected?.Invoke(sticker, watermark);
+        }
+        if (part == DecorDrag.None) return false;
+        _decorDrag = part;
+        _decorStart = e.Location;
+        _decorStartRect = SelectedRect(_decor)!.Value;
+        _decorStartSticker = sticker is { } id ? _decor.Stickers[id] : null;
+        return true;
+    }
+
+    void ContinueDecorDrag(Point p)
+    {
+        float dx = p.X - _decorStart.X, dy = p.Y - _decorStart.Y;
+        var r = _decorStartRect;
+        if (_watermarkSelected)
+        {
+            if (_decorDrag == DecorDrag.Move) r.Offset(dx, dy);
+            else
+            {
+                // Corner handle: keep the top-left fixed and the aspect ratio, follow whichever axis moved further.
+                float k = Math.Max((r.Width + dx) / r.Width, (r.Height + dy) / r.Height);
+                k = Math.Max(k, 8 * S / Math.Min(r.Width, r.Height));
+                r = new RectangleF(r.X, r.Y, r.Width * k, r.Height * k);
+            }
+            var w = _decor.Watermark;
+            if (_decorDrag == DecorDrag.Resize) w = w with { SizePercent = GifCapture.Decor.SizeFor(w, _decor.WatermarkImage, _dest, r.Width) };
+            var (ox, oy) = GifCapture.Decor.OffsetFor(w, _decor.WatermarkImage, _dest, r.Location);
+            _liveDecor = _decor with { Watermark = w with { OffsetX = ox, OffsetY = oy } };
+        }
+        else if (_decorStartSticker is { } s)
+        {
+            // Stickers turn and scale about their centre, which keeps both gestures predictable at any angle.
+            var center = new PointF(r.X + r.Width / 2, r.Y + r.Height / 2);
+            var changed = _decorDrag switch
+            {
+                DecorDrag.Move => s with { X = s.X + dx / _dest.Width, Y = s.Y + dy / _dest.Height },
+                DecorDrag.Resize => s with
+                {
+                    Width = s.Width * Math.Max(Distance(p, center) / Math.Max(1, Distance(_decorStart, center)), 8 * S / Math.Min(r.Width, r.Height)),
+                },
+                _ => s with { Angle = AngleTo(center, p) },
+            };
+            _liveDecor = _decor with { Stickers = new Dictionary<int, Sticker>(_decor.Stickers) { [s.Id] = changed } };
+        }
+        Invalidate();
+    }
+
+    /// <summary>Turn that points the sticker's top at <paramref name="p"/>; Shift snaps to 15° steps.</summary>
+    static float AngleTo(PointF center, PointF p)
+    {
+        float a = MathF.Atan2(p.Y - center.Y, p.X - center.X) * 180 / MathF.PI + 90;
+        if ((ModifierKeys & Keys.Shift) != 0) a = MathF.Round(a / 15) * 15;
+        a = (a % 360 + 360) % 360;
+        return a > 180 ? a - 360 : a;
+    }
+
+    void EndDecorDrag()
+    {
+        _decorDrag = DecorDrag.None;
+        if (_liveDecor is not { } live) return;
+        _liveDecor = null;
+        if (_watermarkSelected) WatermarkEdited?.Invoke(live.Watermark);
+        else if (_selectedSticker is { } id) StickerEdited?.Invoke(live.Stickers[id]);
+        Invalidate();
     }
 
     RectangleF ToScreen(Rectangle img) => new(_dest.X + img.X * _scale, _dest.Y + img.Y * _scale, img.Width * _scale, img.Height * _scale);
@@ -335,7 +561,7 @@ sealed class EditorCanvas : Control
         var chip = new Rectangle((int)c.X, (int)(c.Y - size.Height - 12 * s), size.Width + (int)(14 * s), size.Height + (int)(6 * s));
         if (chip.Y < 0) chip.Y = (int)(c.Y + 6 * s);
         using (var path = Theme.RoundRect(chip, chip.Height / 2f))
-        using (var bg = new SolidBrush(Theme.Accent))
+        using (var bg = new SolidBrush(Theme.AccentFill))
             g.FillPath(bg, path);
         TextRenderer.DrawText(g, text, _labelFont, chip, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
     }
@@ -382,6 +608,8 @@ sealed class EditorCanvas : Control
     {
         base.OnMouseDown(e);
         if (_frame == null) return;
+        Focus(); // so Delete and Esc reach the editor for a picked sticker
+        if (!_cropMode && e.Button == MouseButtons.Left && BeginDecorDrag(e)) return;
         if (e.Button == MouseButtons.Middle || (!_cropMode && e.Button == MouseButtons.Left && _zoom > 0))
         {
             _panning = true;
@@ -406,7 +634,13 @@ sealed class EditorCanvas : Control
             Invalidate();
             return;
         }
-        if (!_cropMode || _frame == null) { Cursor = _zoom > 0 ? Cursors.Hand : Cursors.Default; return; }
+        if (_decorDrag != DecorDrag.None) { ContinueDecorDrag(e.Location); return; }
+        if (!_cropMode || _frame == null)
+        {
+            var part = HitDecor(e.Location).Part;
+            Cursor = part != DecorDrag.None ? DecorCursor(part) : _zoom > 0 ? Cursors.Hand : Cursors.Default;
+            return;
+        }
         if (_drag == Zone.None)
         {
             Cursor = CursorFor(HitTest(e.Location));
@@ -447,6 +681,7 @@ sealed class EditorCanvas : Control
     {
         base.OnMouseUp(e);
         _drag = Zone.None;
+        if (_decorDrag != DecorDrag.None) EndDecorDrag();
         if (_panning) { _panning = false; Cursor = _cropMode ? Cursors.Cross : _zoom > 0 ? Cursors.Hand : Cursors.Default; }
     }
 
@@ -461,6 +696,8 @@ sealed class EditorCanvas : Control
             _toastTimer.Dispose();
             _rotated?.Dispose();
             _piece?.Dispose();
+            foreach (var c in _bitmaps.Values) c.Bitmap.Dispose();
+            _bitmaps.Clear();
         }
         base.Dispose(disposing);
     }

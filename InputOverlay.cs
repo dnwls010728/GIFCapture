@@ -125,12 +125,14 @@ sealed class KeyboardTracker : IDisposable
     }
 }
 
-/// <summary>Draws click rings and the key caption onto captured frames.</summary>
-sealed class InputOverlay
+/// <summary>Draws click rings and the key caption onto captured frames. Draw is single-threaded; dispose once recording ends.</summary>
+sealed class InputOverlay : IDisposable
 {
     readonly bool _clicks;
     readonly KeyboardTracker? _keys;
     readonly float _scale;
+    Font? _font;
+    float _fontPx;
 
     public InputOverlay(bool showClicks, KeyboardTracker? keys, float scale)
     {
@@ -161,10 +163,18 @@ sealed class InputOverlay
         using (var pen = new Pen(color, 3 * _scale)) g.DrawEllipse(pen, c);
     }
 
-    static void DrawKeys(Graphics g, Size frame, string text)
+    public void Dispose() => _font?.Dispose();
+
+    void DrawKeys(Graphics g, Size frame, string text)
     {
         float px = Math.Clamp(frame.Height * 0.055f, 13f, 30f);
-        using var font = new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel);
+        if (_font == null || _fontPx != px)
+        {
+            _font?.Dispose();
+            _font = new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel);
+            _fontPx = px;
+        }
+        var font = _font;
         var size = g.MeasureString(text, font);
         float padX = px * 0.8f, padY = px * 0.35f;
         var box = new RectangleF((frame.Width - size.Width) / 2 - padX, frame.Height - size.Height - padY * 2 - px * 0.8f,

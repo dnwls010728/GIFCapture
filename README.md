@@ -43,16 +43,29 @@ All versions are on the [Releases](https://github.com/dnwls010728/GIFCapture/rel
 - **Captions** for explanatory GIFs, crop, rotate 90°, flip
 - Zoom and pan the preview, full undo / redo
 
+**Decorate**
+- **Watermark** on every frame: text (any installed font and style, colour, size, opacity, optional dark outline for readability) or an image such as a transparent PNG logo
+- Place it with a 9-way position grid, or drag it in the preview and resize it with the corner handle
+- Watermark settings are remembered for next time and also applied by **Quick save**
+- **Insert images** (stickers) on specific frames: add to the selected frames with the button, **Ctrl+V** or by dropping an image file on the preview; move and resize by dragging, set per-image opacity, show on more selected frames or remove from them, and delete with **Del**
+- Inserted images can be **rotated**: drag the round handle above the selected image in the preview (**Shift** snaps to 15°) or use the **Rotate** slider; resizing scales about the image centre
+- Frames with images show a small badge in the timeline; everything is undoable
+
 **Export**
 - One-click use-case presets: **Docs**, **Social** (≤ 1280 px wide), **Game** (high quality, 30 fps)
 - Quality, image size, max FPS, merge near-identical frames, loop count (forever or N times)
-- **Upscaled export**: image size up to 600%, with ×2–×6 buttons or any value on the slider. Choose how pixels are enlarged: **Sharp** (crisp blocks), **Smooth** (bicubic) or **Smart** (Scale2x/3x, smooths jagged diagonals); the preview shows the result
+- **Upscaled export**: image size up to 600%, with ×2–×6 buttons or any value on the slider. Choose how pixels are enlarged: **Blocks** (crisp squares), **Smooth** (bicubic), **Crisp** (Lanczos plus sharpening, best for screen recordings and text) or **Pixel art** (xBR, smooths jagged diagonals and curves); the preview shows the result
 - **Live file size estimate** and **fit to a target size** (e.g. 15 MB) automatically
-- Small files by design: only the changed part of each frame is stored
+- Small files by design: only the changed part of each frame is stored, and each frame's colour table is sized to the colours it actually uses
+- Fast: frames are rendered on several CPU cores while encoding, and saving can be **cancelled** by clicking the save button again
 - Save straight to a folder, copy the file to the clipboard for **Ctrl+V** into chats, or export a **PNG sequence** with a timing CSV for game engines
 - Open existing GIFs to edit them (button, Ctrl+O, or drag and drop)
 
-**Interface** in English, Korean and Japanese, with a dark theme designed for readability.
+**Updates**
+- **Automatic update check**: at startup the app checks GitHub Releases. If a newer version exists, a dialog shows the release notes and can download it, verify its SHA-256, replace the exe and restart (or open the release page if the folder is not writable). **Skip this version** and **Later** are available
+- Turn it off in **Settings → Update**, which also has **Check now**
+
+**Interface** in English, Korean and Japanese, with a dark, high-contrast theme designed for readability. Long labels shrink to fit, and the editor fits smaller screens (the sidebar scrolls).
 
 ## Screenshots
 
@@ -115,11 +128,15 @@ Before recording you can choose:
 The editor opens with every frame on the timeline. Select frames by clicking, Shift-clicking or dragging, then use the
 **Edit** tab to trim, delete, change timing, add a caption, crop or rotate. Every change can be undone with **Ctrl+Z**.
 
+On the **Decorate** tab, add a text or image **watermark** to every frame, or insert images on the frames you selected
+(button, **Ctrl+V**, or drop an image file on the preview). Drag an image or the watermark in the preview to move it and
+use the corner handle to resize it.
+
 ### 5. Export
 On the **Export** tab, pick a use-case preset or set quality, size and FPS yourself. Sizes above 100% enlarge the output
-(**×2–×6** buttons), with a choice of **Sharp / Smooth / Smart** enlargement. The estimated file size updates as you
+(**×2–×6** buttons), with a choice of **Blocks / Smooth / Crisp / Pixel art** enlargement. The estimated file size updates as you
 change settings; set a **Target size** and click **Fit to size** to let the app find settings that fit. Choose the file
-name and click **Save GIF** (**Ctrl+S**). The file is copied to the clipboard so you can paste it straight into a chat.
+name and click **Save GIF** (**Ctrl+S**). The file is copied to the clipboard so you can paste it straight into a chat. Click the button again while saving to cancel.
 
 ## Keyboard shortcuts
 
@@ -132,14 +149,15 @@ name and click **Save GIF** (**Ctrl+S**). The file is copied to the clipboard so
 | Editor | ← → (Shift) | Previous / next frame (extend selection) |
 | Editor | Home / End | First / last frame |
 | Editor | Ctrl+A / Esc | Select all / clear selection |
-| Editor | Del / Ctrl+D | Delete / duplicate frames |
+| Editor | Del / Ctrl+D | Delete / duplicate frames (Del deletes the picked image if one is selected in the preview) |
+| Editor | Ctrl+V | Paste an image from the clipboard |
 | Editor | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Editor | Wheel, Ctrl+0, Ctrl+1 | Zoom, fit, 100% |
 | Editor | Ctrl+S / Ctrl+Shift+C | Save / copy saved file |
 
 ## Privacy
 
-GIF Capture works entirely offline. It does not upload, sync or send anything. The *Show keys* option uses a keyboard hook
+GIF Capture does not upload, sync or send your recordings or any other data. The only network request it makes is the update check against GitHub Releases, which you can turn off in Settings → Update. The *Show keys* option uses a keyboard hook
 only while you are recording, and only to draw the pressed keys into your own GIF.
 
 ## Project layout

@@ -236,3 +236,130 @@ sealed class InputDialog : Form
         return dlg.ShowDialog(owner) == DialogResult.OK ? dlg.Value : null;
     }
 }
+
+/// <summary>3×3 grid for picking which corner, edge or centre something hugs. ←→↑↓ move the pick when focused.</summary>
+sealed class AnchorPicker : ThemedControl
+{
+    Placement _value = Placement.BottomRight;
+    int _hover = -1;
+
+    public event EventHandler? ValueChanged;
+
+    public Placement Value
+    {
+        get => _value;
+        set
+        {
+            if (_value == value) return;
+            _value = value;
+            Invalidate();
+            ValueChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    protected override bool ActivatesOnEnter => false;
+
+    RectangleF Cell(int i)
+    {
+        float w = (Width - 2) / 3f, h = (Height - 2) / 3f;
+        return new RectangleF(1 + i % 3 * w, 1 + i / 3 * h, w, h);
+    }
+
+    int IndexAt(Point p)
+    {
+        for (int i = 0; i < 9; i++) if (Cell(i).Contains(p)) return i;
+        return -1;
+    }
+
+    protected override bool IsInputKey(Keys keyData) => keyData is Keys.Left or Keys.Right or Keys.Up or Keys.Down || base.IsInputKey(keyData);
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        int i = (int)_value, col = i % 3, row = i / 3;
+        switch (e.KeyCode)
+        {
+            case Keys.Left: col = Math.Max(0, col - 1); break;
+            case Keys.Right: col = Math.Min(2, col + 1); break;
+            case Keys.Up: row = Math.Max(0, row - 1); break;
+            case Keys.Down: row = Math.Min(2, row + 1); break;
+            default: base.OnKeyDown(e); return;
+        }
+        Value = (Placement)(row * 3 + col);
+        e.Handled = true;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        int i = IndexAt(e.Location);
+        if (i != _hover) { _hover = i; Invalidate(); }
+        base.OnMouseMove(e);
+    }
+
+    protected override void OnMouseLeave(EventArgs e) { _hover = -1; base.OnMouseLeave(e); }
+
+    protected override void OnMouseClick(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left && Enabled && IndexAt(e.Location) is var i and >= 0) Value = (Placement)i;
+        base.OnMouseClick(e);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = Begin(e);
+        float s = Dpi;
+        using (var path = Theme.RoundRect(new RectangleF(1, 1, Width - 2.5f, Height - 2.5f), 8 * s))
+        {
+            using var fill = new SolidBrush(Theme.Surface);
+            g.FillPath(fill, path);
+            using var pen = new Pen(Theme.Border);
+            g.DrawPath(pen, path);
+            DrawFocusRing(g, path);
+        }
+        for (int i = 0; i < 9; i++)
+        {
+            var c = Cell(i);
+            bool selected = i == (int)_value;
+            float d = (selected ? 12 : 8) * s;
+            var dot = new RectangleF(c.X + (c.Width - d) / 2, c.Y + (c.Height - d) / 2, d, d);
+            var color = !Enabled ? Theme.Faint : selected ? Theme.Accent : i == _hover ? Theme.Text : Theme.Faint;
+            using var b = new SolidBrush(color);
+            if (selected) g.FillRectangle(b, dot);
+            else g.FillEllipse(b, dot);
+        }
+    }
+}
+
+/// <summary>Pill button that shows a colour chip before its text; used to open a colour picker.</summary>
+sealed class SwatchButton : ThemedControl
+{
+    Color _color = Color.White;
+
+    public Color Color
+    {
+        get => _color;
+        set { _color = value; Invalidate(); }
+    }
+
+    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = Begin(e);
+        float s = Dpi;
+        using (var path = Theme.RoundRect(new RectangleF(1, 1, Width - 2.5f, Height - 2.5f), 8 * s))
+        {
+            using var fill = new SolidBrush(SurfaceColor);
+            g.FillPath(fill, path);
+            using var pen = new Pen(Enabled ? Theme.Border : Color.FromArgb(0x2A, 0x2D, 0x35));
+            g.DrawPath(pen, path);
+            DrawFocusRing(g, path);
+        }
+        float d = 16 * s;
+        var chip = new RectangleF(12 * s, (Height - d) / 2, d, d);
+        using (var b = new SolidBrush(Enabled ? Color.FromArgb(255, _color) : Theme.Faint)) g.FillEllipse(b, chip);
+        using (var pen = new Pen(Theme.Faint)) g.DrawEllipse(pen, chip);
+        var textRect = new Rectangle((int)(chip.Right + 8 * s), 0, Width - (int)(chip.Right + 14 * s), Height);
+        TextRenderer.DrawText(g, Text, FitFont(Text, textRect.Width), textRect, Enabled ? Theme.Text : Theme.Faint,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+    }
+}

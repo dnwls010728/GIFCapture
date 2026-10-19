@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
@@ -13,8 +14,11 @@ sealed record ExportOptions(
     int MaxFps,                  // 0 = keep every frame
     bool MergeSimilar,
     int PlayCount,               // 0 = loop forever
-    ResampleMode Resample = ResampleMode.Sharp) // used when enlarging
+    ResampleMode Resample = ResampleMode.Sharp, // used when enlarging
+    DecorSet? Decor = null)      // watermark and stickers; null = none
 {
+    public DecorSet Decorations => Decor ?? DecorSet.Empty;
+
     public int MaxColors => Quality >= 100 ? 256 : 16 + (int)Math.Round(240 * (Quality - 10) / 90.0);
     public int Tolerance => Quality >= 100 ? 0 : (int)Math.Round((100 - Quality) * 0.3);
 
@@ -38,6 +42,9 @@ sealed record ExportOptions(
 
 static class GifExporter
 {
+    /// <summary>Shortest frame time GIF viewers honour (2 cs); the editor never goes below it, so previews match exports.</summary>
+    public const int MinDelayMs = 20;
+
     /// <summary>Changed-pixel share below which two frames count as the same picture.</summary>
     const double SimilarRatio = 0.0005;
 
@@ -115,31 +122,78 @@ static class GifExporter
             t += f.DelayMs;
         }
 
-        // 2. Render and merge. One frame is held back so merges can extend its delay.
+        // 2. Frames are independent until merging, so worker threads render a few ahead while the caller encodes.
+        // The look-ahead is capped by memory as well as cores: enlarged frames can be tens of megabytes each.
+        long frameBytes = Math.Max((long)scaled.Width * scaled.Height, (long)cropped.Width * cropped.Height) * 4;
+        int ahead = (int)Math.Clamp(256L * 1024 * 1024 / Math.Max(1, frameBytes), 1, Math.Max(2, Environment.ProcessorCount));
+        var decor = o.Decorations;
+        var sized = new ConcurrentDictionary<(int? Id, Size Size), ImageAsset>();
+        var queue = new Queue<Task<byte[]>>();
+        int next = 0;
+
+        // 3. Merge in order. One frame is held back so merges can extend its delay.
         byte[]? pending = null;
         int pendingDelay = 0;
-        for (int i = 0; i < groups.Count; i++)
+        try
+        {
+            for (int i = 0; i < groups.Count; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                while (next < groups.Count && queue.Count < ahead)
+                {
+                    var f = groups[next++];
+                    queue.Enqueue(Task.Run(() => RenderFrame(f), ct));
+                }
+                var px = queue.Dequeue().GetAwaiter().GetResult();
+
+                if (pending != null && o.MergeSimilar && NearlyEqual(pending, px, o.Tolerance))
+                {
+                    pendingDelay += groups[i].DelayMs;
+                }
+                else
+                {
+                    if (pending != null) yield return (pending, pendingDelay);
+                    pending = px;
+                    pendingDelay = groups[i].DelayMs;
+                }
+                progress?.Report((i + 1f) / groups.Count);
+            }
+            if (pending != null) yield return (pending, pendingDelay);
+        }
+        finally
+        {
+            // Stopped early (cancelled or failed): observe the workers still running so their errors go nowhere.
+            foreach (var task in queue) _ = task.ContinueWith(static t => _ = t.Exception, TaskScheduler.Default);
+        }
+
+        byte[] RenderFrame(EditFrame f)
         {
             ct.ThrowIfCancellationRequested();
-            var px = store.Read(groups[i].Source);
+            var px = store.Read(f.Source);
             if (!o.Crop.IsEmpty) px = FrameOps.Crop(px, src, o.Crop);
             if (scaled != cropped) px = FrameOps.Scale(px, cropped, scaled, o.Resample);
             if (o.Rotate != RotateFlipType.RotateNoneFlipNone) px = FrameOps.RotateFlip(px, scaled, o.Rotate);
-            if (!string.IsNullOrWhiteSpace(groups[i].Caption)) px = Caption.Burn(px, outSize, groups[i].Caption!);
-
-            if (pending != null && o.MergeSimilar && NearlyEqual(pending, px, o.Tolerance))
-            {
-                pendingDelay += groups[i].DelayMs;
-            }
-            else
-            {
-                if (pending != null) yield return (pending, pendingDelay);
-                pending = px;
-                pendingDelay = groups[i].DelayMs;
-            }
-            progress?.Report((i + 1f) / groups.Count);
+            bool caption = !string.IsNullOrWhiteSpace(f.Caption);
+            if (caption || decor.Any(f.Stickers)) px = Burn(px, outSize, decor, f.Stickers, caption ? f.Caption : null, sized);
+            return px;
         }
-        if (pending != null) yield return (pending, pendingDelay);
+    }
+
+    /// <summary>Draws stickers, watermark and caption over finished pixels in one bitmap round trip.</summary>
+    static byte[] Burn(byte[] px, Size size, DecorSet decor, int[]? stickers, string? caption,
+        ConcurrentDictionary<(int? Id, Size Size), ImageAsset> sized)
+    {
+        using var bmp = FrameOps.ToBitmap(px, size);
+        var area = new RectangleF(0, 0, size.Width, size.Height);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            // Images are shrunk to their drawn size once per export; each frame then draws a small bitmap of its own,
+            // since GDI+ bitmaps cannot be shared between threads.
+            Decor.Draw(g, area, decor, stickers,
+                (id, asset, target) => sized.GetOrAdd((id, target), _ => asset.Resize(target)).CreateBitmap(), disposeBitmaps: true);
+            if (caption != null) Caption.Draw(g, area, caption);
+        }
+        return FrameOps.FromBitmap(bmp);
     }
 
     static bool NearlyEqual(byte[] a, byte[] b, int tolerance)
@@ -186,14 +240,6 @@ static class Caption
         using var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
         g.DrawString(text, font, Brushes.White, box, sf);
         g.Restore(state);
-    }
-
-    public static byte[] Burn(byte[] px, Size size, string text)
-    {
-        using var bmp = FrameOps.ToBitmap(px, size);
-        using (var g = Graphics.FromImage(bmp))
-            Draw(g, new RectangleF(0, 0, size.Width, size.Height), text);
-        return FrameOps.FromBitmap(bmp);
     }
 }
 

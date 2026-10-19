@@ -76,6 +76,40 @@ abstract class ThemedControl : Control
         using var pen = new Pen(Theme.AccentHover, 2 * Dpi);
         g.DrawPath(pen, path);
     }
+
+    readonly Dictionary<(string Text, int Width), Font> _fitted = [];
+
+    /// <summary>
+    /// <see cref="Control.Font"/>, or a slightly smaller copy when <paramref name="text"/> would not fit in
+    /// <paramref name="width"/>, so labels that run long in some languages shrink instead of being cut off.
+    /// </summary>
+    protected Font FitFont(string text, int width)
+    {
+        if (_fitted.TryGetValue((text, width), out var font)) return font;
+        if (_fitted.Count > 32) ClearFitted(); // labels like progress text change constantly
+        font = Font;
+        const TextFormatFlags flags = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
+        for (float size = Font.Size - 0.5f; size >= Font.Size * 0.75f && TextRenderer.MeasureText(text, font, Size.Empty, flags).Width > width; size -= 0.5f)
+        {
+            if (font != Font) font.Dispose();
+            font = new Font(Font.FontFamily, size, Font.Style);
+        }
+        return _fitted[(text, width)] = font;
+    }
+
+    void ClearFitted()
+    {
+        foreach (var f in _fitted.Values) if (f != Font) f.Dispose();
+        _fitted.Clear();
+    }
+
+    protected override void OnFontChanged(EventArgs e) { ClearFitted(); base.OnFontChanged(e); }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) ClearFitted();
+        base.Dispose(disposing);
+    }
 }
 
 enum CardIcon { Region, Window, Screen }
@@ -347,12 +381,12 @@ sealed class Segmented : ThemedControl
             if (selected || (i == _hoverIndex && Enabled))
             {
                 using var path = Theme.RoundRect(seg, 6 * s);
-                using var fill = new SolidBrush(selected ? (Enabled ? Theme.Accent : Theme.SurfacePressed) : Theme.SurfaceHover);
+                using var fill = new SolidBrush(selected ? (Enabled ? Theme.AccentFill : Theme.SurfacePressed) : Theme.SurfaceHover);
                 g.FillPath(fill, path);
             }
             var color = !Enabled ? Theme.Faint : selected ? Color.White : Theme.Muted;
             var label = Labels != null && i < Labels.Length ? Labels[i] : _values[i] + Suffix;
-            TextRenderer.DrawText(g, label, Font, Rectangle.Round(seg), color,
+            TextRenderer.DrawText(g, label, FitFont(label, (int)seg.Width - (int)(4 * s)), Rectangle.Round(seg), color,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
     }
@@ -588,7 +622,7 @@ sealed class ToggleSwitch : ThemedControl
         using (var path = Theme.RoundRect(track, th / 2))
         {
             var on = _checked && Enabled;
-            using var fill = new SolidBrush(on ? (Hover ? Theme.AccentHover : Theme.Accent) : _checked ? Theme.SurfacePressed : (Hover && Enabled ? Theme.SurfaceHover : Theme.Surface));
+            using var fill = new SolidBrush(on ? (Hover ? Theme.AccentFillHover : Theme.AccentFill) : _checked ? Theme.SurfacePressed : (Hover && Enabled ? Theme.SurfaceHover : Theme.Surface));
             g.FillPath(fill, path);
             if (!_checked)
             {
@@ -608,7 +642,7 @@ sealed class ToggleSwitch : ThemedControl
             g.FillEllipse(knob, kx, track.Top + pad, k, k);
 
         var textRect = new Rectangle((int)(tw + 12 * s), 0, Width - (int)(tw + 12 * s), Height);
-        TextRenderer.DrawText(g, Text, Font, textRect, Enabled ? Theme.Text : Theme.Faint,
+        TextRenderer.DrawText(g, Text, FitFont(Text, textRect.Width), textRect, Enabled ? Theme.Text : Theme.Faint,
             TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
     }
 }
@@ -649,7 +683,7 @@ sealed class PillButton : ThemedControl
         {
             Color fill;
             if (_accent)
-                fill = _progress >= 0 ? Theme.AccentSoft : !Enabled ? Theme.Surface : Pressed ? Theme.AccentPressed : Hover ? Theme.AccentHover : Theme.Accent;
+                fill = _progress >= 0 ? Theme.AccentSoft : !Enabled ? Theme.Surface : Pressed ? Theme.AccentFillPressed : Hover ? Theme.AccentFillHover : Theme.AccentFill;
             else if (_danger && Enabled && (Hover || Pressed))
                 fill = Color.FromArgb(Pressed ? 0x4A : 0x3A, 0x22, 0x28);
             else
@@ -660,7 +694,7 @@ sealed class PillButton : ThemedControl
             {
                 var state = g.Save();
                 g.SetClip(path);
-                using var bar = new SolidBrush(Theme.Accent);
+                using var bar = new SolidBrush(Theme.AccentFill);
                 g.FillRectangle(bar, r.X, r.Y, r.Width * Math.Clamp(_progress, 0, 1), r.Height);
                 g.Restore(state);
             }
@@ -677,7 +711,7 @@ sealed class PillButton : ThemedControl
             : !Enabled ? Theme.Faint
             : _danger ? Theme.Danger
             : Theme.Text;
-        TextRenderer.DrawText(g, Text, Font, ClientRectangle, color,
+        TextRenderer.DrawText(g, Text, FitFont(Text, Width - (int)(12 * s)), ClientRectangle, color,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
     }
 }
@@ -704,7 +738,7 @@ sealed class IconButton : ThemedControl
         var r = new RectangleF(1, 1, Width - 2.5f, Height - 2.5f);
         using (var path = Theme.RoundRect(r, 8 * s))
         {
-            var fillColor = Primary && Enabled ? (Pressed ? Theme.AccentPressed : Hover ? Theme.AccentHover : Theme.Accent) : SurfaceColor;
+            var fillColor = Primary && Enabled ? (Pressed ? Theme.AccentFillPressed : Hover ? Theme.AccentFillHover : Theme.AccentFill) : SurfaceColor;
             using var fill = new SolidBrush(fillColor);
             g.FillPath(fill, path);
             if (!Primary)

@@ -4,7 +4,7 @@ namespace GifCapture;
 
 static class Theme
 {
-    // Contrast against Bg: Text ≈ 16:1, Muted ≈ 8:1, Faint ≈ 4.6:1 (still readable when disabled).
+    // Contrast against Bg: Text ≈ 16:1, Muted ≈ 8.8:1, Faint ≈ 5.6:1 (≥ 4.5:1 on Surface too, so disabled text stays readable).
     public static readonly Color Bg = Color.FromArgb(0x14, 0x15, 0x19);
     public static readonly Color Surface = Color.FromArgb(0x20, 0x22, 0x28);
     public static readonly Color SurfaceHover = Color.FromArgb(0x2B, 0x2E, 0x37);
@@ -12,10 +12,14 @@ static class Theme
     public static readonly Color Border = Color.FromArgb(0x3A, 0x3E, 0x49);
     public static readonly Color Text = Color.FromArgb(0xF1, 0xF2, 0xF5);
     public static readonly Color Muted = Color.FromArgb(0xB0, 0xB4, 0xC0);
-    public static readonly Color Faint = Color.FromArgb(0x80, 0x85, 0x92);
+    public static readonly Color Faint = Color.FromArgb(0x8E, 0x93, 0xA0);
+    // Accent is for lines and text on the dark background; AccentFill is for surfaces under white text (≥ 4.5:1).
     public static readonly Color Accent = Color.FromArgb(0x5B, 0x8D, 0xFF);
     public static readonly Color AccentHover = Color.FromArgb(0x74, 0x9F, 0xFF);
     public static readonly Color AccentPressed = Color.FromArgb(0x4A, 0x78, 0xE0);
+    public static readonly Color AccentFill = Color.FromArgb(0x3A, 0x6B, 0xE0);
+    public static readonly Color AccentFillHover = Color.FromArgb(0x3F, 0x70, 0xE6);
+    public static readonly Color AccentFillPressed = Color.FromArgb(0x33, 0x60, 0xD0);
     public static readonly Color AccentSoft = Color.FromArgb(0x1F, 0x2B, 0x47);
     public static readonly Color Rec = Color.FromArgb(0xFF, 0x4D, 0x5E);
     public static readonly Color Danger = Color.FromArgb(0xFF, 0x7A, 0x86);
@@ -52,12 +56,16 @@ static class Theme
         }
     }
 
+    // Shared by every label and box that uses them, so one font object each lives for the whole app.
+    static readonly Font TextBoxFont = new("Segoe UI", 10f);
+    static readonly Font SectionFont = new("Segoe UI", 9f, FontStyle.Bold);
+
     public static void StyleTextBox(TextBox box)
     {
         box.BackColor = Surface;
         box.ForeColor = Text;
         box.BorderStyle = BorderStyle.FixedSingle;
-        box.Font = new Font("Segoe UI", 10f);
+        box.Font = TextBoxFont;
     }
 
     public static Label MutedLabel(string text, Rectangle bounds) =>
@@ -72,7 +80,7 @@ static class Theme
             BackColor = Bg,
             Bounds = bounds,
             TextAlign = ContentAlignment.MiddleLeft,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Font = SectionFont,
         };
 
     /// <summary>Owner-drawn tooltip that matches the dark theme.</summary>

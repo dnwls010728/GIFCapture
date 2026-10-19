@@ -120,7 +120,7 @@ sealed class RegionSelector : Form
             var text = _mode == SelectMode.Region || _selLabel.Length == 0
                 ? $"{_sel.Width} × {_sel.Height}"
                 : $"{Truncate(_selLabel, 60)}   {_sel.Width} × {_sel.Height}";
-            DrawChip(g, text, LabelRect(_sel, text), _labelFont, Theme.Accent, Color.White);
+            DrawChip(g, text, LabelRect(_sel, text), _labelFont, Theme.AccentFill, Color.White);
         }
 
         if (_mode == SelectMode.Region && _cursorPos is { } c)

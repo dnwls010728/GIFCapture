@@ -13,6 +13,8 @@ sealed class Timeline : Control
     public Func<int, int>? DelayFor { get; set; }
     /// <summary>Whether the frame at a position carries a caption (drawn as a small badge).</summary>
     public Func<int, bool>? HasCaption { get; set; }
+    /// <summary>Whether the frame at a position carries inserted images (drawn as a second badge).</summary>
+    public Func<int, bool>? HasStickers { get; set; }
     public IReadOnlySet<int> Selection { get; set; } = new HashSet<int>();
     public float Aspect { get; set; } = 16 / 9f;
 
@@ -26,7 +28,7 @@ sealed class Timeline : Control
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
         BackColor = Theme.Bg;
-        _small = new Font("Segoe UI", 8.5f);
+        _small = new Font("Segoe UI", 9f);
     }
 
     public int Count
@@ -79,6 +81,17 @@ sealed class Timeline : Control
         Invalidate();
     }
 
+    /// <summary>Small filled tag ending at <paramref name="right"/>; returns where the next one to its left should end.</summary>
+    float Badge(Graphics g, string text, Color fill, float right, float top, float s)
+    {
+        var badge = new RectangleF(right - 18 * s, top, 18 * s, 16 * s);
+        using (var path = Theme.RoundRect(badge, 4 * s))
+        using (var b = new SolidBrush(fill))
+            g.FillPath(b, path);
+        TextRenderer.DrawText(g, text, _small, Rectangle.Round(badge), Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        return badge.X - 3 * s;
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
@@ -129,16 +142,11 @@ sealed class Timeline : Control
             var labelRect = new Rectangle(r.X, r.Bottom + (int)(3 * s), r.Width, LabelH);
             TextRenderer.DrawText(g, $"{i + 1}", _small, labelRect, i == _current ? Theme.Text : Theme.Muted,
                 TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPadding);
-            if (HasCaption?.Invoke(i) == true)
-            {
-                var badge = new RectangleF(r.Right - 22 * s, r.Y + 4 * s, 18 * s, 16 * s);
-                using (var path = Theme.RoundRect(badge, 4 * s))
-                using (var b = new SolidBrush(Theme.Accent))
-                    g.FillPath(b, path);
-                TextRenderer.DrawText(g, "T", _small, Rectangle.Round(badge), Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-            }
+            float badgeRight = r.Right - 4 * s;
+            if (HasCaption?.Invoke(i) == true) badgeRight = Badge(g, "T", Theme.AccentFill, badgeRight, r.Y + 4 * s, s);
+            if (HasStickers?.Invoke(i) == true) Badge(g, "▣", Color.FromArgb(0x1B, 0x7F, 0x53), badgeRight, r.Y + 4 * s, s);
             if (DelayFor != null && r.Width >= 60 * s)
-                TextRenderer.DrawText(g, $"{DelayFor(i)}ms", _small, labelRect, Theme.Faint,
+                TextRenderer.DrawText(g, $"{DelayFor(i)}ms", _small, labelRect, Theme.Muted,
                     TextFormatFlags.Right | TextFormatFlags.Top | TextFormatFlags.NoPadding);
         }
 

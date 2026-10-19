@@ -249,6 +249,31 @@ sealed class MainForm : Form
     /// This window is TopMost, and a normal modal window it owns can end up behind it with no way to reach it.
     /// Drop TopMost for as long as the dialog is open.
     /// </summary>
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        _ = CheckForUpdateAsync();
+    }
+
+    /// <summary>Startup look for a new release. Quiet when offline or up to date, and never interrupts a recording.</summary>
+    async Task CheckForUpdateAsync()
+    {
+        if (!_settings.CheckUpdates) return;
+        ReleaseInfo? release;
+        try { release = await Updater.CheckAsync(CancellationToken.None); }
+        catch (Exception ex) when (Updater.IsCheckFailure(ex)) { return; } // try again next start
+        if (release == null || release.Version.ToString(3) == _settings.SkippedVersion) return;
+        if (IsDisposed || _recorder != null || _busy || _countdownCts != null) return;
+        if (Application.OpenForms.OfType<Form>().Any(f => f.Modal)) return; // a dialog is up; ask next start rather than stack on it
+        using var dlg = new UpdateForm(release);
+        WithoutTopMost(() => dlg.ShowDialog(this));
+        if (dlg.Skipped)
+        {
+            _settings.SkippedVersion = release.Version.ToString(3);
+            _settings.Save();
+        }
+    }
+
     T WithoutTopMost<T>(Func<T> show)
     {
         bool was = TopMost;
@@ -790,10 +815,10 @@ sealed class MainForm : Form
     /// <summary>"바로 저장": encode with the last export settings and drop the file in the save folder.</summary>
     async Task QuickSave(FrameStore store, IReadOnlyList<int> delays)
     {
-        var frames = delays.Select((d, i) => new EditFrame(i, Math.Max(10, d))).ToList();
+        var frames = delays.Select((d, i) => new EditFrame(i, Math.Max(GifExporter.MinDelayMs, d))).ToList();
         var s = _settings;
         var options = new ExportOptions(Rectangle.Empty, RotateFlipType.RotateNoneFlipNone, s.ScalePercent, s.Quality,
-            s.LimitFps ? s.MaxFps : 0, s.MergeSimilar, s.PlayCount, s.Resample);
+            s.LimitFps ? s.MaxFps : 0, s.MergeSimilar, s.PlayCount, s.Resample, DecorSet.FromWatermark(s.Watermark));
         var progress = new Progress<float>(p => _statusSub.Text = $"{p * 100:0}%");
         SetStatus(L.T("저장 중…"), "0%", Theme.Text);
         try

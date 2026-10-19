@@ -3,12 +3,16 @@ using System.Diagnostics;
 
 namespace GifCapture;
 
-readonly record struct EditFrame(int Source, int DelayMs, string? Caption = null);
+/// <param name="Stickers">Ids of the stickers shown on this frame, drawn in order; null = none.</param>
+readonly record struct EditFrame(int Source, int DelayMs, string? Caption = null, int[]? Stickers = null);
 
 /// <summary>Post-recording editor: browse, trim, retime, caption, crop and rotate frames, tune export settings, then save.</summary>
 sealed class EditorForm : Form
 {
-    sealed record Snapshot(EditFrame[] Frames, Rectangle Crop, int Angle, bool Flip, int Current);
+    sealed record Snapshot(EditFrame[] Frames, Rectangle Crop, int Angle, bool Flip, int Current, Watermark Watermark, Sticker[] Stickers);
+
+    /// <summary>Undo steps kept; older ones are dropped.</summary>
+    const int UndoLimit = 100;
 
     enum OutputFormat { Gif, PngSequence }
 
@@ -24,13 +28,29 @@ sealed class EditorForm : Form
     int _current, _anchor;
     bool _dirty = true, _exporting, _applyingPreset;
 
-    // Display
+    // Display. While playing, the next frames are decoded ahead on a worker so the UI thread only copies pixels.
     readonly Bitmap _view;
     int _viewSource = -1;
+    readonly ConcurrentDictionary<int, Task<byte[]>> _prefetch = new();
+
+    // Watermark & stickers. Images are only ever added, so undo never has to bring one back.
+    Watermark _watermark;
+    ImageAsset? _watermarkImage;
+    string? _watermarkImagePath;
+    readonly Dictionary<int, Sticker> _stickers = [];
+    readonly Dictionary<int, ImageAsset> _images = [];
+    int _nextId = 1;
+    bool _syncingDecor;
+
+    // Rapid edits of one kind (slider drags, typing) within a moment share an undo step.
+    Snapshot? _mergeSnap;
+    object? _mergeKey;
+    readonly Stopwatch _mergeClock = new();
 
     // Thumbnails, generated in the background
     readonly ConcurrentDictionary<int, Bitmap> _thumbs = new();
     readonly ConcurrentStack<int> _thumbRequests = new();
+    readonly ConcurrentDictionary<int, byte> _thumbQueued = new(); // keeps repaints from stacking duplicate requests
     readonly SemaphoreSlim _thumbSignal = new(0);
     readonly CancellationTokenSource _cts = new();
     Task? _thumbWorker;
@@ -45,7 +65,7 @@ sealed class EditorForm : Form
 
     // File size estimate / target-size fitting
     readonly System.Windows.Forms.Timer _estimateTimer = new() { Interval = 600 };
-    CancellationTokenSource? _estimateCts, _fitCts;
+    CancellationTokenSource? _estimateCts, _fitCts, _exportCts;
     string _estimateText = "";
 
     // Canvas & playback bar
@@ -64,9 +84,27 @@ sealed class EditorForm : Form
     readonly PillButton _keysBtn = new() { Text = L.T("단축키") };
 
     // Sidebar
-    readonly Segmented _tabs = new() { Values = [0, 1], Labels = [L.T("편집"), L.T("내보내기")] };
-    readonly Panel _editPanel = new() { BackColor = Theme.Bg };
-    readonly Panel _exportPanel = new() { BackColor = Theme.Bg, Visible = false };
+    readonly Segmented _tabs = new() { Values = [0, 1, 2], Labels = [L.T("편집"), L.T("꾸미기"), L.T("내보내기")] };
+    readonly Panel _editPanel = new() { BackColor = Theme.Bg, AutoScroll = true };
+    readonly Panel _decorPanel = new() { BackColor = Theme.Bg, AutoScroll = true, Visible = false };
+    readonly Panel _exportPanel = new() { BackColor = Theme.Bg, AutoScroll = true, Visible = false };
+
+    readonly ToggleSwitch _wmOn = new() { Text = L.T("워터마크 넣기") };
+    readonly Segmented _wmKind = new() { Values = [0, 1], Labels = [L.T("텍스트"), L.T("이미지")] };
+    readonly TextBox _wmText = new();
+    readonly PillButton _wmImageBtn = new() { Text = L.T("이미지 파일 선택") };
+    readonly PillButton _wmFontBtn = new();
+    readonly SwatchButton _wmColorBtn = new() { Text = L.T("색상") };
+    readonly ThemedSlider _wmSize = new() { Text = L.T("크기"), Minimum = 1, Maximum = 60, Suffix = "%" };
+    readonly ThemedSlider _wmOpacity = new() { Text = L.T("불투명도"), Minimum = 10, Maximum = 100, Step = 5, Suffix = "%" };
+    readonly AnchorPicker _wmAnchor = new();
+    readonly ToggleSwitch _wmOutline = new() { Text = L.T("외곽선") };
+    readonly PillButton _stickerAddBtn = new() { Text = L.T("이미지 추가") };
+    readonly PillButton _stickerDeleteBtn = new() { Text = L.T("이미지 삭제"), Danger = true };
+    readonly PillButton _stickerShowBtn = new() { Text = L.T("선택 프레임에도 표시") };
+    readonly PillButton _stickerHideBtn = new() { Text = L.T("선택 프레임에서 빼기") };
+    readonly ThemedSlider _stickerOpacity = new() { Text = L.T("불투명도"), Minimum = 10, Maximum = 100, Step = 5, Suffix = "%" };
+    readonly ThemedSlider _stickerAngle = new() { Text = L.T("회전"), Minimum = -180, Maximum = 180, Suffix = "°" };
 
     readonly PillButton _deleteBtn = new() { Text = L.T("삭제"), Danger = true };
     readonly PillButton _keepBtn = new() { Text = L.T("선택만 남기기") };
@@ -75,7 +113,7 @@ sealed class EditorForm : Form
     readonly PillButton _dupBtn = new() { Text = L.T("복제") };
     readonly PillButton _reverseBtn = new() { Text = L.T("역재생") };
     readonly PillButton _yoyoBtn = new() { Text = L.T("왕복 재생") };
-    readonly NumberStepper _delayBox = new() { Minimum = 10, Maximum = 10000, Step = 10, Suffix = "ms" };
+    readonly NumberStepper _delayBox = new() { Minimum = GifExporter.MinDelayMs, Maximum = 10000, Step = 10, Suffix = "ms" };
     readonly PillButton _delayBtn = new() { Text = L.T("선택에 적용") };
     readonly PillButton _slowerBtn = new() { Text = L.T("느리게 ×0.5") };
     readonly PillButton _fasterBtn = new() { Text = L.T("빠르게 ×2") };
@@ -92,7 +130,11 @@ sealed class EditorForm : Form
     readonly ThemedSlider _scale = new() { Text = L.T("이미지 크기"), Minimum = 10, Maximum = 600, Step = 5, Suffix = "%",
         Describe = v => v > 100 ? $"×{v / 100.0:0.##}" : "" };
     readonly Segmented _scalePreset = new() { Values = [100, 200, 300, 400, 500, 600], Labels = ["×1", "×2", "×3", "×4", "×5", "×6"] };
-    readonly Segmented _resample = new() { Values = [0, 1, 2], Labels = [L.T("픽셀 그대로"), L.T("부드럽게"), L.T("픽셀 보정")] };
+    readonly Segmented _resample = new()
+    {
+        Values = [(int)ResampleMode.Sharp, (int)ResampleMode.Smooth, (int)ResampleMode.Crisp, (int)ResampleMode.Smart],
+        Labels = [L.T("그대로"), L.T("부드럽게"), L.T("선명하게"), L.T("픽셀아트")],
+    };
     readonly ToggleSwitch _limitFps = new() { Text = L.T("초당 프레임 제한") };
     readonly NumberStepper _maxFps = new() { Minimum = 1, Maximum = 50, Suffix = "fps" };
     readonly ToggleSwitch _merge = new() { Text = L.T("비슷한 프레임 합치기") };
@@ -122,7 +164,8 @@ sealed class EditorForm : Form
     {
         _store = store;
         _srcSize = store.FrameSize;
-        _frames = Enumerable.Range(0, store.Count).Select(i => new EditFrame(i, Math.Max(10, i < delays.Count ? delays[i] : 100))).ToList();
+        _frames = Enumerable.Range(0, store.Count).Select(i => new EditFrame(i, Math.Max(GifExporter.MinDelayMs, i < delays.Count ? delays[i] : 100))).ToList();
+        _watermark = _settings.Watermark;
         _view = new Bitmap(_srcSize.Width, _srcSize.Height, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
         _thumbBox = new Size((int)(220 * DeviceDpi / 96f), (int)(124 * DeviceDpi / 96f));
 
@@ -156,9 +199,12 @@ sealed class EditorForm : Form
         _timeline.ThumbnailFor = ThumbnailAt;
         _timeline.DelayFor = i => _frames[i].DelayMs;
         _timeline.HasCaption = i => !string.IsNullOrWhiteSpace(_frames[i].Caption);
+        _timeline.HasStickers = i => _frames[i].Stickers is { Length: > 0 };
         _timeline.Selection = _sel;
         _sel.Add(0);
 
+        LoadWatermarkImage(quiet: true);
+        SyncWatermarkControls();
         RefreshAll();
     }
 
@@ -174,7 +220,8 @@ sealed class EditorForm : Form
         Icon = Theme.AppIcon;
         KeyPreview = true;
         ClientSize = new Size(1200, 840);
-        MinimumSize = new Size(1060, 880);
+        // Short screens still fit: the sidebar tabs scroll when the window is lower than their content.
+        MinimumSize = new Size(1060, 700);
 
         // Bottom: playback bar over the timeline.
         const int barW = 1200 - 284;
@@ -212,10 +259,11 @@ sealed class EditorForm : Form
         _tabs.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
         side.Controls.Add(_tabs);
 
-        foreach (var p in new[] { _editPanel, _exportPanel })
+        foreach (var p in new[] { _editPanel, _decorPanel, _exportPanel })
         {
             p.Bounds = new Rectangle(1, 64, 283, H - 64 - 160);
             p.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left;
+            p.HandleCreated += (_, _) => Native.ApplyDarkScrollBars(p.Handle);
             side.Controls.Add(p);
         }
 
@@ -238,6 +286,35 @@ sealed class EditorForm : Form
         ep.Controls.Add(Theme.SectionLabel(L.T("자르기 · 회전"), new Rectangle(L0 - 1, 438, Full, 24)));
         Place(ep, _cropBtn, L0, 466, W); Place(ep, _cropResetBtn, R, 466, W);
         Place(ep, _rotateBtn, L0, 508, W); Place(ep, _flipBtn, R, 508, W);
+
+        // Decorate tab: watermark on every frame, images on chosen frames
+        var dp = _decorPanel;
+        dp.Controls.Add(Theme.SectionLabel(L.T("워터마크"), new Rectangle(L0 - 1, 4, Full, 24)));
+        _wmOn.Bounds = new Rectangle(L0, 30, Full, 30);
+        _wmKind.Bounds = new Rectangle(L0, 66, Full, 32);
+        Theme.StyleTextBox(_wmText);
+        _wmText.Bounds = new Rectangle(L0, 106, Full, 30);
+        _wmText.PlaceholderText = L.T("워터마크 문구 입력");
+        _wmImageBtn.Bounds = new Rectangle(L0, 104, Full, 36);
+        _wmFontBtn.Bounds = new Rectangle(L0, 146, W, 36);
+        _wmColorBtn.Bounds = new Rectangle(R, 146, W, 36);
+        _wmSize.Bounds = new Rectangle(L0, 188, Full, 50);
+        _wmOpacity.Bounds = new Rectangle(L0, 242, Full, 50);
+        _wmAnchor.Bounds = new Rectangle(L0, 300, 96, 72);
+        _wmOutline.Bounds = new Rectangle(L0 + 108, 300, Full - 108, 30);
+        var wmHint = Theme.MutedLabel(L.T("미리보기에서 끌어 옮기기"), new Rectangle(L0 + 108, 330, Full - 108, 44));
+        wmHint.TextAlign = ContentAlignment.TopLeft;
+        dp.Controls.AddRange([_wmOn, _wmKind, _wmText, _wmImageBtn, _wmFontBtn, _wmColorBtn, _wmSize, _wmOpacity, _wmAnchor, _wmOutline, wmHint]);
+
+        dp.Controls.Add(Theme.SectionLabel(L.T("이미지 삽입"), new Rectangle(L0 - 1, 382, Full, 24)));
+        Place(dp, _stickerAddBtn, L0, 408, W); Place(dp, _stickerDeleteBtn, R, 408, W);
+        Place(dp, _stickerShowBtn, L0, 450, Full);
+        Place(dp, _stickerHideBtn, L0, 492, Full);
+        _stickerOpacity.Bounds = new Rectangle(L0, 534, W, 50);
+        _stickerAngle.Bounds = new Rectangle(R, 534, W, 50);
+        var stickerHint = Theme.MutedLabel(L.T("Ctrl+V 붙여넣기 · 끌어다 놓기 · Del 삭제"), new Rectangle(L0, 588, Full, 24));
+        stickerHint.TextAlign = ContentAlignment.TopLeft;
+        dp.Controls.AddRange([_stickerOpacity, _stickerAngle, stickerHint]);
 
         // Export tab
         var xp = _exportPanel;
@@ -297,7 +374,7 @@ sealed class EditorForm : Form
         _tips.SetToolTip(_redoBtn, "Ctrl+Y");
         _tips.SetToolTip(_fitBtn, L.T("창에 맞추기 (Ctrl+0)"));
         _tips.SetToolTip(_actualBtn, L.T("실제 크기 (Ctrl+1). 미리보기에서 휠로 확대/축소, 드래그로 이동"));
-        _tips.SetToolTip(_keysBtn, L.T("Space  재생 / 일시정지\n←  →  이전 / 다음 프레임   (Shift: 선택 확장)\nHome  End  처음 / 끝\nShift·Ctrl + 클릭, 드래그  여러 개 선택\nCtrl+A  전체 선택     Esc  선택 해제\nDel  삭제     Ctrl+D  복제\nCtrl+Z / Ctrl+Y  실행 취소 / 다시 실행\n휠  확대/축소     Ctrl+0  맞춤     Ctrl+1  100%\nCtrl+S  저장     Ctrl+Shift+C  복사"));
+        _tips.SetToolTip(_keysBtn, L.T("Space  재생 / 일시정지\n←  →  이전 / 다음 프레임   (Shift: 선택 확장)\nHome  End  처음 / 끝\nShift·Ctrl + 클릭, 드래그  여러 개 선택\nCtrl+A  전체 선택     Esc  선택 해제\nDel  삭제 (미리보기에서 고른 이미지가 있으면 그 이미지)\nCtrl+D  복제     Ctrl+V  이미지 붙여넣기\nCtrl+Z / Ctrl+Y  실행 취소 / 다시 실행\n휠  확대/축소     Ctrl+0  맞춤     Ctrl+1  100%\nCtrl+S  저장     Ctrl+Shift+C  복사"));
         _tips.SetToolTip(_deleteBtn, L.T("선택한 프레임 삭제 (Del)"));
         _tips.SetToolTip(_keepBtn, L.T("선택하지 않은 프레임을 모두 삭제"));
         _tips.SetToolTip(_trimStartBtn, L.T("현재 프레임보다 앞의 프레임을 모두 삭제"));
@@ -315,7 +392,7 @@ sealed class EditorForm : Form
         _tips.SetToolTip(_quality, L.T("낮추면 색 수를 줄이고 미세한 변화를 무시해 용량이 줄어듭니다."));
         _tips.SetToolTip(_scale, L.T("내보낼 GIF의 가로·세로 비율. 줄이면 용량이 크게 줄어듭니다."));
         _tips.SetToolTip(_scalePreset, L.T("배율로 확대합니다. 미리보기에서 Ctrl+1로 실제 크기를 확인하세요."));
-        _tips.SetToolTip(_resample, L.T("확대할 때 픽셀을 그리는 방식.\n픽셀 그대로: 각 픽셀을 선명한 사각형으로\n부드럽게: 경계를 흐리게 보간\n픽셀 보정: 사각형을 유지하되 계단진 대각선을 다듬음"));
+        _tips.SetToolTip(_resample, L.T("확대할 때 픽셀을 그리는 방식.\n그대로: 각 픽셀을 선명한 사각형으로\n부드럽게: 경계를 부드럽게 보간\n선명하게: 보간한 뒤 윤곽을 또렷하게 (화면 녹화·글자에 추천)\n픽셀아트: 도트 그림의 계단진 대각선과 곡선을 매끄럽게"));
         _tips.SetToolTip(_limitFps, L.T("초당 프레임 수를 제한해 용량을 줄입니다. 재생 시간은 그대로."));
         _tips.SetToolTip(_merge, L.T("거의 똑같은 연속 프레임을 하나로 합칩니다. 재생 시간은 그대로."));
         _tips.SetToolTip(_playCount, L.T("GIF가 재생되는 횟수. 0이면 무한 반복."));
@@ -323,7 +400,22 @@ sealed class EditorForm : Form
         _tips.SetToolTip(_format, L.T("PNG 시퀀스: 프레임마다 PNG 파일과 표시 시간 CSV를 폴더에 저장 (게임 엔진용)"));
         _tips.SetToolTip(_folderBtn, L.T("저장할 폴더를 고릅니다."));
         _tips.SetToolTip(_copyBtn, L.T("저장한 파일을 클립보드에 복사 (Ctrl+Shift+C). 메신저에 Ctrl+V로 붙여넣기."));
-        _tips.SetToolTip(_exportBtn, L.T("저장 위치에 바로 저장 (Ctrl+S)"));
+        _tips.SetToolTip(_exportBtn, L.T("저장 위치에 바로 저장 (Ctrl+S). 저장 중에 다시 누르면 취소합니다."));
+        _tips.SetToolTip(_wmOn, L.T("모든 프레임에 같은 워터마크를 넣습니다. 설정은 다음에도 유지됩니다."));
+        _tips.SetToolTip(_wmFontBtn, L.T("워터마크 글꼴과 굵기를 고릅니다."));
+        _tips.SetToolTip(_wmColorBtn, L.T("워터마크 글자 색을 고릅니다."));
+        _tips.SetToolTip(_wmSize, L.T("텍스트: 글자 높이 (화면 높이 대비)\n이미지: 너비 (화면 너비 대비)"));
+        _tips.SetToolTip(_wmAnchor, L.T("워터마크를 붙일 위치. 고르면 끌어 옮긴 위치는 초기화됩니다.\n미리보기에서 끌어 옮기고 모서리 핸들로 크기를 바꿀 수 있습니다."));
+        _tips.SetToolTip(_wmOutline, L.T("글자 둘레에 어두운 테두리를 그려 어떤 배경에서도 잘 보이게 합니다."));
+        _tips.SetToolTip(_stickerAddBtn, L.T("이미지 파일을 골라 선택한 프레임에 넣습니다."));
+        _tips.SetToolTip(_stickerDeleteBtn, L.T("고른 이미지를 모든 프레임에서 지웁니다 (Del)."));
+        _tips.SetToolTip(_stickerShowBtn, L.T("고른 이미지를 타임라인에서 선택한 프레임에도 표시합니다."));
+        _tips.SetToolTip(_stickerAngle, L.T("고른 이미지를 돌립니다. 미리보기에서 위쪽 동그란 핸들을 끌어도 되고, Shift를 누르면 15° 단위로 맞춰집니다."));
+        _tips.SetToolTip(_stickerHideBtn, L.T("고른 이미지를 타임라인에서 선택한 프레임에서만 뺍니다."));
+        _tips.SetToolTip(_captionClearBtn, L.T("선택한 프레임의 자막을 지웁니다."));
+        _tips.SetToolTip(_cropResetBtn, L.T("자르기를 없애고 전체 화면으로 되돌립니다."));
+        _tips.SetToolTip(_rotateBtn, L.T("시계 방향으로 90° 돌립니다."));
+        _tips.SetToolTip(_flipBtn, L.T("좌우를 뒤집습니다."));
     }
 
     /// <summary>Keeps the whole output in view while the user tunes enlargement, so the preview does not jump around.</summary>
@@ -356,14 +448,71 @@ sealed class EditorForm : Form
         _redoBtn.Click += (_, _) => Redo();
         _fitBtn.Click += (_, _) => _canvas.ZoomToFit();
         _actualBtn.Click += (_, _) => _canvas.ZoomTo(1f);
-        _keysBtn.Click += (_, _) => Notify(L.T("단축키 버튼에 마우스를 올리면 전체 목록이 보입니다"), durationMs: 3000);
+        _keysBtn.Click += (_, _) =>
+        {
+            // Open the full list above the button; hovering shows the same text.
+            var text = _tips.GetToolTip(_keysBtn);
+            using var font = new Font("Segoe UI", 9f);
+            int h = TextRenderer.MeasureText(text, font, new Size(320, 0), TextFormatFlags.WordBreak).Height + 18;
+            _tips.Show(text, _keysBtn, _keysBtn.Width - 340, -h - 6, 12000);
+        };
         _canvas.ZoomChanged += (_, _) => Notify(_canvas.IsFit ? L.T("창에 맞춤") : L.F("확대 {0}%", _canvas.ZoomPercent), durationMs: 900);
 
         _tabs.ValueChanged += (_, _) =>
         {
             if (_canvas.CropMode) CommitCrop();
             _editPanel.Visible = _tabs.Value == 0;
-            _exportPanel.Visible = _tabs.Value == 1;
+            _decorPanel.Visible = _tabs.Value == 1;
+            _exportPanel.Visible = _tabs.Value == 2;
+        };
+
+        _wmOn.CheckedChanged += (_, _) => SetWatermark(WatermarkFromControls());
+        _wmKind.ValueChanged += (_, _) =>
+        {
+            // Text is sized by height and images by width, so each kind starts from its own sensible size.
+            bool image = _wmKind.Value == 1;
+            SetWatermark(WatermarkFromControls() with { SizePercent = image ? 20 : 6, OffsetX = 0, OffsetY = 0 });
+        };
+        _wmText.TextChanged += (_, _) => SetWatermark(WatermarkFromControls());
+        _wmSize.ValueChanged += (_, _) => SetWatermark(WatermarkFromControls());
+        _wmOpacity.ValueChanged += (_, _) => SetWatermark(WatermarkFromControls());
+        _wmOutline.CheckedChanged += (_, _) => SetWatermark(WatermarkFromControls());
+        _wmAnchor.ValueChanged += (_, _) => SetWatermark(WatermarkFromControls() with { OffsetX = 0, OffsetY = 0 });
+        _wmFontBtn.Click += (_, _) => ChooseWatermarkFont();
+        _wmColorBtn.Click += (_, _) => ChooseWatermarkColor();
+        _wmImageBtn.Click += (_, _) => ChooseWatermarkImage();
+        _stickerAddBtn.Click += (_, _) => { if (PickImage(L.T("넣을 이미지")) is { } a) AddSticker(a); };
+        _stickerDeleteBtn.Click += (_, _) => { if (_canvas.SelectedSticker is { } id) DeleteSticker(id); };
+        _stickerShowBtn.Click += (_, _) => { if (_canvas.SelectedSticker is { } id) ShowStickerOnSelection(id); };
+        _stickerHideBtn.Click += (_, _) => { if (_canvas.SelectedSticker is { } id) HideStickerFromSelection(id); };
+        _stickerOpacity.ValueChanged += (_, _) =>
+        {
+            if (_syncingDecor || _canvas.SelectedSticker is not { } id || !_stickers.TryGetValue(id, out var s)) return;
+            MergedEdit(("opacity", id), () => _stickers[id] = s with { Opacity = _stickerOpacity.Value });
+        };
+        _stickerAngle.ValueChanged += (_, _) =>
+        {
+            if (_syncingDecor || _canvas.SelectedSticker is not { } id || !_stickers.TryGetValue(id, out var s)) return;
+            MergedEdit(("angle", id), () => _stickers[id] = s with { Angle = _stickerAngle.Value });
+        };
+        _canvas.DecorSelected += (sticker, watermark) =>
+        {
+            if (sticker != null || watermark) _tabs.Value = 1; // bring the controls for what was picked into view
+            UpdateDecorControls();
+        };
+        _canvas.StickerEdited += s => Apply(L.T("이미지 위치·크기·각도 바꿈"), () => { _stickers[s.Id] = s; return true; });
+        _canvas.WatermarkEdited += w =>
+        {
+            SetWatermark(w);
+            SyncWatermarkControls();
+        };
+        _canvas.AllowDrop = true;
+        _canvas.DragEnter += (_, e) => e.Effect = DroppedImagePath(e.Data) != null ? DragDropEffects.Copy : DragDropEffects.None;
+        _canvas.DragDrop += (_, e) =>
+        {
+            if (DroppedImagePath(e.Data) is not { } path) return;
+            if (DecorSet.TryLoad(path) is { } asset) AddSticker(asset);
+            else Notify(L.T("이미지를 열 수 없습니다"), error: true);
         };
 
         _deleteBtn.Click += (_, _) => DeleteSelected();
@@ -505,11 +654,14 @@ sealed class EditorForm : Form
         int src = _frames[_current].Source;
         if (src != _viewSource)
         {
-            FrameOps.CopyInto(_view, _store.Read(src));
+            var px = _prefetch.TryRemove(src, out var ready) ? ready.GetAwaiter().GetResult() : _store.Read(src);
+            FrameOps.CopyInto(_view, px);
             _viewSource = src;
             _canvas.FrameUpdated();
         }
+        if (_playing) Prefetch();
         _canvas.Caption = _frames[_current].Caption;
+        _canvas.FrameStickers = _frames[_current].Stickers;
         _canvas.Invalidate();
         _timeline.Current = _current;
         _timeline.EnsureVisible(_current);
@@ -530,6 +682,18 @@ sealed class EditorForm : Form
         bool multi = count > 1;
         _deleteBtn.Text = multi ? L.F("삭제 ({0})", count) : L.T("삭제");
         _selLabel.Text = multi ? L.F("{0}개 선택", count) : "";
+        UpdateDecorControls();
+    }
+
+    /// <summary>Starts decoding the next couple of frames in playback order, dropping ones that are no longer near.</summary>
+    void Prefetch()
+    {
+        var wanted = new HashSet<int>();
+        for (int k = 1; k <= 2 && _frames.Count > 1; k++) wanted.Add(_frames[(_current + k) % _frames.Count].Source);
+        foreach (var src in _prefetch.Keys)
+            if (!wanted.Contains(src)) _prefetch.TryRemove(src, out _);
+        foreach (var src in wanted)
+            if (src != _viewSource) _prefetch.GetOrAdd(src, s => Task.Run(() => _store.Read(s)));
     }
 
     void RefreshAll()
@@ -543,6 +707,7 @@ sealed class EditorForm : Form
         _undoBtn.Enabled = _undo.Count > 0;
         _redoBtn.Enabled = _redo.Count > 0;
         _cropResetBtn.Enabled = _canvas.CropMode || !_crop.IsEmpty;
+        _canvas.Decor = CurrentDecor();
         ShowCurrent();
         UpdateSummary();
         ScheduleEstimate();
@@ -562,7 +727,10 @@ sealed class EditorForm : Form
 
     ExportOptions CurrentOptions(Rectangle? crop = null) => new(
         crop ?? _crop, RotateType, _scale.Value, _quality.Value,
-        _limitFps.Checked ? _maxFps.Value : 0, _merge.Checked, _playCount.Value, (ResampleMode)_resample.Value);
+        _limitFps.Checked ? _maxFps.Value : 0, _merge.Checked, _playCount.Value, (ResampleMode)_resample.Value, CurrentDecor());
+
+    /// <summary>Copies of the decoration state, safe to hand to background estimates and exports.</summary>
+    DecorSet CurrentDecor() => new(_watermark, _watermarkImage, new Dictionary<int, Sticker>(_stickers), new Dictionary<int, ImageAsset>(_images));
 
     /// <summary>Bottom-of-sidebar summary: output size, length and estimated file size.</summary>
     void UpdateSummary()
@@ -745,7 +913,35 @@ sealed class EditorForm : Form
 
     // ───────────── Edit operations ─────────────
 
-    Snapshot TakeSnapshot() => new(_frames.ToArray(), _crop, _angle, _flip, _current);
+    Snapshot TakeSnapshot() => new(_frames.ToArray(), _crop, _angle, _flip, _current, _watermark, _stickers.Values.ToArray());
+
+    void PushUndo(Snapshot before)
+    {
+        _undo.Push(before);
+        _redo.Clear();
+        if (_undo.Count <= UndoLimit + 20) return; // trim in batches; rebuilding the stack is not free
+        var keep = _undo.Take(UndoLimit).Reverse().ToArray();
+        _undo.Clear();
+        foreach (var s in keep) _undo.Push(s);
+    }
+
+    /// <summary>Pushes an undo step unless the last one was the same kind of edit (<paramref name="key"/>) moments ago.</summary>
+    void MergedEdit(object key, Action mutate)
+    {
+        StopPlayback();
+        bool merge = _mergeSnap != null && _undo.TryPeek(out var top) && top == _mergeSnap
+            && Equals(key, _mergeKey) && _mergeClock.ElapsedMilliseconds < 1500;
+        if (!merge)
+        {
+            _mergeSnap = TakeSnapshot();
+            _mergeKey = key;
+            PushUndo(_mergeSnap);
+        }
+        _mergeClock.Restart();
+        mutate();
+        _dirty = true;
+        RefreshAll();
+    }
 
     void Apply(string done, Func<bool> mutate)
     {
@@ -758,8 +954,7 @@ sealed class EditorForm : Form
 
     void Commit(Snapshot before, string done)
     {
-        _undo.Push(before);
-        _redo.Clear();
+        PushUndo(before);
         _dirty = true;
         Notify(done, undoable: true);
         RefreshAll();
@@ -773,6 +968,11 @@ sealed class EditorForm : Form
         _angle = s.Angle;
         _flip = s.Flip;
         _current = s.Current;
+        _watermark = _settings.Watermark = s.Watermark;
+        _stickers.Clear();
+        foreach (var st in s.Stickers) _stickers[st.Id] = st;
+        LoadWatermarkImage(quiet: true);
+        SyncWatermarkControls();
         _sel.Clear();
         _sel.Add(Math.Clamp(_current, 0, _frames.Count - 1));
         _anchor = _current;
@@ -922,7 +1122,7 @@ sealed class EditorForm : Form
         Apply(factor > 1 ? L.T("2배 빠르게") : L.T("2배 느리게"), () =>
         {
             foreach (var i in range)
-                _frames[i] = _frames[i] with { DelayMs = Math.Clamp((int)Math.Round(_frames[i].DelayMs / factor), 10, 60000) };
+                _frames[i] = _frames[i] with { DelayMs = Math.Clamp((int)Math.Round(_frames[i].DelayMs / factor), GifExporter.MinDelayMs, 60000) };
             return true;
         });
     }
@@ -950,6 +1150,204 @@ sealed class EditorForm : Form
             change();
             return true;
         });
+    }
+
+    // ───────────── Watermark ─────────────
+
+    Watermark WatermarkFromControls() => _watermark with
+    {
+        Enabled = _wmOn.Checked,
+        IsImage = _wmKind.Value == 1,
+        Text = _wmText.Text,
+        SizePercent = _wmSize.Value,
+        Opacity = _wmOpacity.Value,
+        Outline = _wmOutline.Checked,
+        Anchor = _wmAnchor.Value,
+    };
+
+    void SetWatermark(Watermark w)
+    {
+        if (_syncingDecor || w == _watermark) return;
+        MergedEdit("watermark", () =>
+        {
+            _watermark = _settings.Watermark = w;
+            LoadWatermarkImage(quiet: false);
+        });
+        SyncWatermarkControls();
+    }
+
+    /// <summary>Loads the watermark image when its file changes. An unreadable file is reported (unless quiet) and left out.</summary>
+    void LoadWatermarkImage(bool quiet)
+    {
+        var path = _watermark.IsImage ? _watermark.ImagePath : null;
+        if (path == _watermarkImagePath) return;
+        _watermarkImagePath = path;
+        _watermarkImage = path == null ? null : DecorSet.TryLoad(path);
+        if (path != null && _watermarkImage == null && !quiet) Notify(L.T("워터마크 이미지를 열 수 없습니다"), error: true);
+    }
+
+    /// <summary>Shows the watermark in the controls without the changes counting as edits.</summary>
+    void SyncWatermarkControls()
+    {
+        _syncingDecor = true;
+        var w = _watermark;
+        _wmOn.Checked = w.Enabled;
+        _wmKind.Value = w.IsImage ? 1 : 0;
+        if (_wmText.Text != w.Text) _wmText.Text = w.Text;
+        _wmSize.Value = w.SizePercent;
+        _wmOpacity.Value = w.Opacity;
+        _wmOutline.Checked = w.Outline;
+        _wmAnchor.Value = w.Anchor;
+        _wmColorBtn.Color = Color.FromArgb(w.ColorArgb);
+        _wmFontBtn.Text = w.FontFamily;
+        _wmImageBtn.Text = w.ImagePath != null ? Path.GetFileName(w.ImagePath) : L.T("이미지 파일 선택");
+        _tips.SetToolTip(_wmImageBtn, w.ImagePath ?? L.T("로고 같은 이미지를 고릅니다. 투명 PNG가 잘 어울립니다."));
+
+        _wmText.Visible = _wmFontBtn.Visible = _wmColorBtn.Visible = _wmOutline.Visible = !w.IsImage;
+        _wmImageBtn.Visible = w.IsImage;
+        foreach (var c in new Control[] { _wmKind, _wmText, _wmImageBtn, _wmFontBtn, _wmColorBtn, _wmSize, _wmOpacity, _wmAnchor, _wmOutline })
+            c.Enabled = w.Enabled;
+        _syncingDecor = false;
+    }
+
+    void ChooseWatermarkFont()
+    {
+        using var current = new Font(_watermark.FontFamily, 14f, _watermark.FontStyle);
+        using var dialog = new FontDialog { Font = current, ShowEffects = false, FontMustExist = true, AllowVerticalFonts = false };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        SetWatermark(_watermark with { FontFamily = dialog.Font.FontFamily.Name, FontStyle = dialog.Font.Style & (FontStyle.Bold | FontStyle.Italic) });
+    }
+
+    void ChooseWatermarkColor()
+    {
+        using var dialog = new ColorDialog { Color = Color.FromArgb(_watermark.ColorArgb), FullOpen = true };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        SetWatermark(_watermark with { ColorArgb = Color.FromArgb(255, dialog.Color).ToArgb() });
+    }
+
+    void ChooseWatermarkImage()
+    {
+        using var dialog = new OpenFileDialog { Title = L.T("워터마크 이미지"), Filter = ImageFilter };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        if (DecorSet.TryLoad(dialog.FileName) == null)
+        {
+            Notify(L.T("이미지를 열 수 없습니다"), error: true);
+            return;
+        }
+        SetWatermark(_watermark with { ImagePath = dialog.FileName, Enabled = true });
+    }
+
+    // ───────────── Stickers ─────────────
+
+    static string ImageFilter => L.T("이미지") + "|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp|" + L.T("모든 파일") + "|*.*";
+
+    static readonly string[] ImageExtensions = [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"];
+
+    static string? DroppedImagePath(IDataObject? data) =>
+        data?.GetData(DataFormats.FileDrop) is string[] files
+            ? files.FirstOrDefault(f => ImageExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
+            : null;
+
+    ImageAsset? PickImage(string title)
+    {
+        using var dialog = new OpenFileDialog { Title = title, Filter = ImageFilter };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return null;
+        var asset = DecorSet.TryLoad(dialog.FileName);
+        if (asset == null) Notify(L.T("이미지를 열 수 없습니다"), error: true);
+        return asset;
+    }
+
+    void PasteImage()
+    {
+        ImageAsset? asset = null;
+        try
+        {
+            if (Clipboard.ContainsImage() && Clipboard.GetImage() is { } image)
+                using (image) asset = ImageAsset.FromImage(image);
+            else if (DroppedImagePath(Clipboard.GetDataObject()) is { } path)
+                asset = DecorSet.TryLoad(path);
+        }
+        catch (Exception e) when (e is System.Runtime.InteropServices.ExternalException or ThreadStateException)
+        {
+            // Clipboard held by another app.
+        }
+        if (asset != null) AddSticker(asset);
+        else Notify(L.T("클립보드에 이미지가 없습니다"), error: true);
+    }
+
+    /// <summary>Places a new image in the middle of the selected frames, at its own size if that fits.</summary>
+    void AddSticker(ImageAsset asset)
+    {
+        var t = Targets();
+        var output = CurrentOptions().OutputSize(_srcSize);
+        float width = Math.Min(asset.Size.Width / (float)output.Width, 0.4f);
+        width = Math.Min(width, 0.6f * output.Height / (asset.Aspect * output.Width)); // keep tall images inside the frame too
+        int imageId = _nextId++;
+        _images[imageId] = asset;
+        var sticker = new Sticker(_nextId++, imageId, 0.5f, 0.5f, Math.Max(width, 0.02f));
+        Apply(L.F("{0}개 프레임에 이미지 넣음", t.Count), () =>
+        {
+            _stickers[sticker.Id] = sticker;
+            foreach (var i in t) _frames[i] = _frames[i] with { Stickers = [.. _frames[i].Stickers ?? [], sticker.Id] };
+            return true;
+        });
+        _tabs.Value = 1;
+        _canvas.SelectedSticker = sticker.Id;
+        UpdateDecorControls();
+    }
+
+    void DeleteSticker(int id)
+    {
+        Apply(L.T("이미지 삭제"), () =>
+        {
+            _stickers.Remove(id);
+            for (int i = 0; i < _frames.Count; i++)
+                if (_frames[i].Stickers?.Contains(id) == true) _frames[i] = _frames[i] with { Stickers = Without(_frames[i].Stickers!, id) };
+            return true;
+        });
+        _canvas.SelectedSticker = null;
+        UpdateDecorControls();
+    }
+
+    void ShowStickerOnSelection(int id)
+    {
+        var t = Targets().Where(i => _frames[i].Stickers?.Contains(id) != true).ToList();
+        if (t.Count == 0) { Notify(L.T("선택한 프레임에 이미 표시되어 있습니다"), error: true); return; }
+        Apply(L.F("{0}개 프레임에 이미지 표시", t.Count), () =>
+        {
+            foreach (var i in t) _frames[i] = _frames[i] with { Stickers = [.. _frames[i].Stickers ?? [], id] };
+            return true;
+        });
+    }
+
+    void HideStickerFromSelection(int id)
+    {
+        var t = Targets().Where(i => _frames[i].Stickers?.Contains(id) == true).ToList();
+        if (t.Count == 0) { Notify(L.T("선택한 프레임에는 이 이미지가 없습니다"), error: true); return; }
+        Apply(L.F("{0}개 프레임에서 이미지 뺌", t.Count), () =>
+        {
+            foreach (var i in t) _frames[i] = _frames[i] with { Stickers = Without(_frames[i].Stickers!, id) };
+            if (!_frames.Any(f => f.Stickers?.Contains(id) == true)) _stickers.Remove(id); // shown nowhere: gone
+            return true;
+        });
+    }
+
+    static int[]? Without(int[] ids, int id)
+    {
+        var rest = ids.Where(x => x != id).ToArray();
+        return rest.Length == 0 ? null : rest;
+    }
+
+    /// <summary>Enables the sticker buttons for the image picked in the preview.</summary>
+    void UpdateDecorControls()
+    {
+        bool picked = _canvas.SelectedSticker is { } id && _stickers.ContainsKey(id);
+        if (!picked && _canvas.SelectedSticker != null) _canvas.SelectedSticker = null; // deleted, or undone away
+        _stickerDeleteBtn.Enabled = _stickerShowBtn.Enabled = _stickerHideBtn.Enabled = _stickerOpacity.Enabled = _stickerAngle.Enabled = picked;
+        _syncingDecor = true;
+        _stickerOpacity.Value = picked ? _stickers[_canvas.SelectedSticker!.Value].Opacity : 100;
+        _stickerAngle.Value = picked ? (int)Math.Round(_stickers[_canvas.SelectedSticker!.Value].Angle) : 0;
+        _syncingDecor = false;
     }
 
     // ───────────── Crop ─────────────
@@ -1055,6 +1453,7 @@ sealed class EditorForm : Form
         if (position >= _frames.Count) return null;
         int src = _frames[position].Source;
         if (_thumbs.TryGetValue(src, out var bmp)) return bmp;
+        if (!_thumbQueued.TryAdd(src, 0)) return null; // already waiting
         _thumbRequests.Push(src);
         if (_thumbSignal.CurrentCount == 0) _thumbSignal.Release();
         return null;
@@ -1077,6 +1476,7 @@ sealed class EditorForm : Form
 
                 var thumb = FrameOps.Thumbnail(_store.Read(src), _srcSize, _thumbBox);
                 if (!_thumbs.TryAdd(src, thumb)) thumb.Dispose();
+                _thumbQueued.TryRemove(src, out _);
 
                 if (Interlocked.Exchange(ref _thumbRepaintPending, 1) == 0)
                 {
@@ -1133,7 +1533,16 @@ sealed class EditorForm : Form
 
     async Task Export()
     {
-        if (_exporting || _fitCts != null) return;
+        if (_exporting)
+        {
+            _exportCts?.Cancel(); // the save button doubles as cancel while saving
+            return;
+        }
+        if (_fitCts != null)
+        {
+            Notify(L.T("용량 맞추기가 끝난 뒤 저장할 수 있습니다"), error: true);
+            return;
+        }
         StopPlayback();
         if (_canvas.CropMode) CommitCrop();
         _estimateCts?.Cancel();
@@ -1157,15 +1566,18 @@ sealed class EditorForm : Form
         var baseName = Path.GetFileName(path);
 
         _exporting = true;
-        _exportBtn.Enabled = false;
+        var cts = new CancellationTokenSource();
+        _exportCts = cts;
+        bool folderExisted = Directory.Exists(path);
         _exportBtn.Progress = 0;
         _openFolderBtn.Visible = _openFileBtn.Visible = _copyBtn.Visible = false;
         SetStatus(L.T("저장 중…") + "\n" + baseName);
         var idleText = _exportBtn.Text;
         var progress = new Progress<float>(p =>
         {
+            if (cts.IsCancellationRequested) return;
             _exportBtn.Progress = p;
-            _exportBtn.Text = $"{L.T("저장 중")}  {p * 100:0}%";
+            _exportBtn.Text = $"{L.T("저장 중")}  {p * 100:0}%  ·  {L.T("취소")}";
         });
 
         try
@@ -1174,14 +1586,22 @@ sealed class EditorForm : Form
             {
                 if (format == OutputFormat.PngSequence)
                 {
-                    GifExporter.ExportPngSequence(path, baseName, _store, frames, options, progress, CancellationToken.None);
+                    try
+                    {
+                        GifExporter.ExportPngSequence(path, baseName, _store, frames, options, progress, cts.Token);
+                    }
+                    catch (OperationCanceledException) when (!folderExisted)
+                    {
+                        try { Directory.Delete(path, recursive: true); } catch (IOException) { } // half-written folder
+                        throw;
+                    }
                     return;
                 }
                 var temp = path + ".part";
                 try
                 {
                     using (var fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16))
-                        GifExporter.Export(fs, _store, frames, options, progress, CancellationToken.None);
+                        GifExporter.Export(fs, _store, frames, options, progress, cts.Token);
                     File.Move(temp, path, overwrite: true);
                 }
                 catch
@@ -1204,6 +1624,11 @@ sealed class EditorForm : Form
             _settings.Save();
             Notify(copied ? L.F("저장하고 클립보드에 복사했습니다  ·  {0}", FormatSize(SavedBytes)) : L.F("저장했습니다  ·  {0}", FormatSize(SavedBytes)));
         }
+        catch (OperationCanceledException)
+        {
+            SetStatus(L.T("저장을 취소했습니다"));
+            Notify(L.T("저장을 취소했습니다"));
+        }
         catch (Exception ex)
         {
             SetStatus(L.T("저장 실패") + "\n" + ex.Message, Theme.Rec);
@@ -1211,7 +1636,8 @@ sealed class EditorForm : Form
         finally
         {
             _exporting = false;
-            _exportBtn.Enabled = true;
+            _exportCts = null;
+            cts.Dispose();
             _exportBtn.Progress = -1;
             _exportBtn.Text = idleText;
         }
@@ -1219,7 +1645,11 @@ sealed class EditorForm : Form
 
     void CopySaved()
     {
-        if (SavedPath == null || !File.Exists(SavedPath)) return;
+        if (SavedPath == null || !File.Exists(SavedPath))
+        {
+            Notify(L.T("먼저 GIF로 저장하세요"), error: true);
+            return;
+        }
         bool ok = ClipboardHelper.CopyFile(SavedPath);
         Notify(ok ? L.T("클립보드에 복사했습니다. Ctrl+V로 붙여넣으세요") : L.T("클립보드를 사용할 수 없습니다"), error: !ok);
     }
@@ -1241,6 +1671,11 @@ sealed class EditorForm : Form
             if (keyData is not (Keys.Control | Keys.S) and not (Keys.Control | Keys.Z) and not (Keys.Control | Keys.Y))
                 return base.ProcessCmdKey(ref msg, keyData);
         }
+        if (ActiveControl is TextBox box && box != _nameBox && box != _captionBox)
+        {
+            // Other text fields (the watermark text) keep every key except save.
+            if (keyData is not (Keys.Control | Keys.S)) return base.ProcessCmdKey(ref msg, keyData);
+        }
         if (ActiveControl is NumberStepper stepper)
         {
             if (keyData == Keys.Enter && stepper == _delayBox)
@@ -1256,6 +1691,8 @@ sealed class EditorForm : Form
         // Sliders and segmented pickers use ←→ for their value.
         if (ActiveControl is ThemedSlider or Segmented && keyData is Keys.Left or Keys.Right)
             return base.ProcessCmdKey(ref msg, keyData);
+        if (ActiveControl is AnchorPicker && keyData is Keys.Left or Keys.Right or Keys.Up or Keys.Down)
+            return base.ProcessCmdKey(ref msg, keyData);
 
         switch (keyData)
         {
@@ -1268,7 +1705,13 @@ sealed class EditorForm : Form
             case Keys.End: Jump(_frames.Count - 1, false); return true;
             case Keys.Shift | Keys.Home: Jump(0, true); return true;
             case Keys.Shift | Keys.End: Jump(_frames.Count - 1, true); return true;
-            case Keys.Delete: DeleteSelected(); return true;
+            case Keys.Delete:
+                // With an image or the watermark picked in the preview, Delete removes that instead of frames.
+                if (_canvas.Focused && _canvas.SelectedSticker is { } sticker) DeleteSticker(sticker);
+                else if (_canvas.Focused && _canvas.WatermarkSelected) SetWatermark(_watermark with { Enabled = false });
+                else DeleteSelected();
+                return true;
+            case Keys.Control | Keys.V: PasteImage(); return true;
             case Keys.Control | Keys.Z: Undo(); return true;
             case Keys.Control | Keys.Y:
             case Keys.Control | Keys.Shift | Keys.Z: Redo(); return true;
@@ -1281,6 +1724,12 @@ sealed class EditorForm : Form
             case Keys.Enter when _canvas.CropMode: CommitCrop(); return true;
             case Keys.Escape:
                 if (_canvas.CropMode) CancelCrop();
+                else if (_canvas.SelectedSticker != null || _canvas.WatermarkSelected)
+                {
+                    _canvas.SelectedSticker = null;
+                    _canvas.WatermarkSelected = false;
+                    UpdateDecorControls();
+                }
                 else { SelectOnly(_current); ShowCurrent(); }
                 return true;
         }
@@ -1292,7 +1741,7 @@ sealed class EditorForm : Form
         if (_exporting)
         {
             e.Cancel = true;
-            Notify(L.T("저장이 끝난 뒤 닫을 수 있습니다"), error: true);
+            Notify(L.T("저장 중입니다. 저장 버튼을 눌러 취소한 뒤 닫으세요"), error: true);
             return;
         }
         if (_dirty && e.CloseReason == CloseReason.UserClosing)

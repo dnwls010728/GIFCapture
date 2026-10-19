@@ -34,6 +34,11 @@ sealed class AppSettings
     public bool MergeSimilar { get; set; } = true;
     public int PlayCount { get; set; }
     public int TargetSizeMb { get; set; } = 15;
+    /// <summary>Look for a new release on GitHub at startup.</summary>
+    public bool CheckUpdates { get; set; } = true;
+    /// <summary>Release the user chose not to hear about again (e.g. "1.3.0").</summary>
+    public string? SkippedVersion { get; set; }
+    public Watermark Watermark { get; set; } = new();
 
     public static SizePreset[] BuiltInPresets =>
     [

@@ -287,4 +287,10 @@ static class Native
         DwmSetWindowAttribute(hWnd, DWMWA_CAPTION_COLOR, ref colorRef, sizeof(int));
         DwmSetWindowAttribute(hWnd, DWMWA_BORDER_COLOR, ref colorRef, sizeof(int));
     }
+
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr hWnd, string appName, string? idList);
+
+    /// <summary>Dark scroll bars on a scrolling panel (Windows 10 1809+; older systems keep the light ones).</summary>
+    public static void ApplyDarkScrollBars(IntPtr hWnd) => SetWindowTheme(hWnd, "DarkMode_Explorer", null);
 }
