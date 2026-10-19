@@ -39,6 +39,8 @@ sealed class AppSettings
     /// <summary>Release the user chose not to hear about again (e.g. "1.3.0").</summary>
     public string? SkippedVersion { get; set; }
     public Watermark Watermark { get; set; } = new();
+    /// <summary>Look of the last text added in the editor, used for the next one.</summary>
+    public TextStyle TextStyle { get; set; } = new();
 
     public static SizePreset[] BuiltInPresets =>
     [

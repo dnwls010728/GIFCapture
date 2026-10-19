@@ -15,7 +15,7 @@
 
 GIF Capture is a lightweight Windows screen recorder that turns what you record into a GIF. It is built for the everyday
 cases: showing a bug to a teammate, a short how-to for documentation, or a clip of a game. Pick an area, press **F9**,
-press **F9** again, and you have a GIF — or open the editor first to trim, caption and shrink it.
+press **F9** again, and you have a GIF — or open the editor first to trim, add text and shrink it.
 
 Nothing leaves your computer. There is no account, no upload and no cloud: recordings and GIFs are saved only on this PC.
 
@@ -40,7 +40,7 @@ All versions are on the [Releases](https://github.com/dnwls010728/GIFCapture/rel
 - Timeline with thumbnails, playback, multi-select (Shift / Ctrl / drag)
 - Delete, keep selection, **trim start / end**, duplicate, reverse, ping-pong loop
 - Per-frame duration and 2× faster / slower
-- **Captions** for explanatory GIFs, crop, rotate 90°, flip
+- Crop, rotate 90°, flip (captions are text items on the Decorate tab)
 - Zoom and pan the preview, full undo / redo
 
 **Decorate**
@@ -49,7 +49,11 @@ All versions are on the [Releases](https://github.com/dnwls010728/GIFCapture/rel
 - Watermark settings are remembered for next time and also applied by **Quick save**
 - **Insert images** (stickers) on specific frames: add to the selected frames with the button, **Ctrl+V** or by dropping an image file on the preview; move and resize by dragging, set per-image opacity, show on more selected frames or remove from them, and delete with **Del**
 - Inserted images can be **rotated**: drag the round handle above the selected image in the preview (**Shift** snaps to 15°) or use the **Rotate** slider; resizing scales about the image centre
-- Frames with images show a small badge in the timeline; everything is undoable
+- **Text · Images · Mosaic** section: add **text** in any installed font, colour and size, with an optional dark backdrop (caption look) and/or outline; move, resize and rotate it in the preview like images (**Shift** snaps to 15°); double-click a text in the preview to edit it. **Enter** in the text box adds the typed text to the selected frames along the bottom. The last text look is remembered
+- **Captions are text items**: "Add text" places text at the bottom centre with the dark backdrop by default, which is what captions were, but it can now be moved, resized, rotated and restyled
+- **Mosaic**: pixelate part of chosen frames to hide private information; drag to move, use the corner handle to change its shape (any aspect ratio) and rotate it; the **Cell size** slider (1-10) sets how coarse it is. Mosaics only hide the recorded picture: text and images placed over them stay sharp
+- Items (text, image, mosaic) can be shown on or removed from the selected frames, have opacity and angle sliders, and **Del** deletes the picked one
+- Frames with items show small timeline badges (**T** text, **▣** image, **▦** mosaic); everything is undoable
 
 **Export**
 - One-click use-case presets: **Docs**, **Social** (≤ 1280 px wide), **Game** (high quality, 30 fps)
@@ -126,11 +130,11 @@ Before recording you can choose:
 
 ### 4. Edit (optional)
 The editor opens with every frame on the timeline. Select frames by clicking, Shift-clicking or dragging, then use the
-**Edit** tab to trim, delete, change timing, add a caption, crop or rotate. Every change can be undone with **Ctrl+Z**.
+**Edit** tab to trim, delete, change timing, crop or rotate. Every change can be undone with **Ctrl+Z**.
 
-On the **Decorate** tab, add a text or image **watermark** to every frame, or insert images on the frames you selected
-(button, **Ctrl+V**, or drop an image file on the preview). Drag an image or the watermark in the preview to move it and
-use the corner handle to resize it.
+On the **Decorate** tab, add a text or image **watermark** to every frame, or add text (including captions), images and mosaics to the frames you
+selected (button, **Enter**, **Ctrl+V**, or drop an image file on the preview). Drag an item or the watermark in the
+preview to move it and use the corner handle to resize it.
 
 ### 5. Export
 On the **Export** tab, pick a use-case preset or set quality, size and FPS yourself. Sizes above 100% enlarge the output
@@ -149,7 +153,7 @@ name and click **Save GIF** (**Ctrl+S**). The file is copied to the clipboard so
 | Editor | ← → (Shift) | Previous / next frame (extend selection) |
 | Editor | Home / End | First / last frame |
 | Editor | Ctrl+A / Esc | Select all / clear selection |
-| Editor | Del / Ctrl+D | Delete / duplicate frames (Del deletes the picked image if one is selected in the preview) |
+| Editor | Del / Ctrl+D | Delete / duplicate frames (Del deletes the picked item if one is selected in the preview) |
 | Editor | Ctrl+V | Paste an image from the clipboard |
 | Editor | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Editor | Wheel, Ctrl+0, Ctrl+1 | Zoom, fit, 100% |

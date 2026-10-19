@@ -34,11 +34,41 @@ sealed record Watermark
     [JsonIgnore] public bool Visible => Enabled && (IsImage ? ImagePath != null : !string.IsNullOrWhiteSpace(Text));
 }
 
+/// <summary>What an item placed on frames is.</summary>
+enum StickerKind { Image, Text, Mosaic }
+
+/// <summary>Look of a text item. The defaults give the classic caption: white bold letters on a dark box.</summary>
+sealed record TextStyle
+{
+    public string FontFamily { get; init; } = "Segoe UI";
+    public FontStyle FontStyle { get; init; } = FontStyle.Bold;
+    public int ColorArgb { get; init; } = Color.White.ToArgb();
+    public bool Outline { get; init; }
+    /// <summary>Dark rounded box behind the letters.</summary>
+    public bool Box { get; init; } = true;
+    /// <summary>Letter height as a fraction of the output height.</summary>
+    public float Size { get; init; } = 0.065f;
+}
+
 /// <summary>
-/// An image placed on some frames. Centre and width are fractions of the output; height follows the image's aspect.
+/// An item placed on some frames: an image, a line of text, or a pixelated patch. The centre is a fraction of the output.
+/// An image's <see cref="Width"/> is a fraction of the output width and its height follows the image's aspect; text is
+/// sized by its <see cref="Style"/>; a mosaic has both <see cref="Width"/> and <see cref="Height"/>.
 /// <see cref="Angle"/> turns it clockwise about its centre, in degrees.
 /// </summary>
-sealed record Sticker(int Id, int ImageId, float X, float Y, float Width, int Opacity = 100, float Angle = 0);
+sealed record Sticker(int Id, int ImageId, float X, float Y, float Width, int Opacity = 100, float Angle = 0)
+{
+    public StickerKind Kind { get; init; }
+    public string Text { get; init; } = "";
+    public TextStyle Style { get; init; } = new();
+    /// <summary>Mosaic: height as a fraction of the output height.</summary>
+    public float Height { get; init; }
+    /// <summary>Mosaic: cell size from 1 (fine) to 10 (coarse).</summary>
+    public int Cell { get; init; } = 4;
+}
+
+/// <summary>Pixels the decorations go over, which a mosaic averages: a BGRA buffer and the part of it the output area shows.</summary>
+readonly record struct PixelSource(byte[] Bgra, int Width, Rectangle Region);
 
 /// <summary>Decoded pixels of an inserted image (straight-alpha BGRA). Immutable, so any thread can turn it into a bitmap.</summary>
 sealed class ImageAsset(Size size, byte[] bgra)
@@ -122,7 +152,7 @@ sealed class ImageAsset(Size size, byte[] bgra)
     }
 }
 
-/// <summary>Everything drawn over the frames besides captions, shared by the preview and the export.</summary>
+/// <summary>Everything drawn over the frames, shared by the preview and the export.</summary>
 sealed record DecorSet(Watermark Watermark, ImageAsset? WatermarkImage, IReadOnlyDictionary<int, Sticker> Stickers,
     IReadOnlyDictionary<int, ImageAsset> Images)
 {
@@ -151,11 +181,32 @@ static class Decor
     /// <summary>Gap between an anchored watermark and the frame edge, as a fraction of the shorter side.</summary>
     const float Margin = 0.03f;
 
-    public static RectangleF StickerRect(Sticker s, ImageAsset image, RectangleF area)
+    /// <summary>Mosaic cell edge per <see cref="Sticker.Cell"/> step, as a fraction of the shorter side.</summary>
+    const float CellStep = 0.012f;
+
+    /// <summary>Unturned box of a sticker, or null when its image is missing.</summary>
+    public static RectangleF? StickerRect(Sticker s, DecorSet set, RectangleF area)
     {
-        float w = s.Width * area.Width, h = w * image.Aspect;
-        return new RectangleF(area.X + s.X * area.Width - w / 2, area.Y + s.Y * area.Height - h / 2, w, h);
+        SizeF size;
+        switch (s.Kind)
+        {
+            case StickerKind.Text:
+                using (TextBlock(s, area, out var box)) size = box.Size;
+                break;
+            case StickerKind.Mosaic:
+                size = new SizeF(s.Width * area.Width, s.Height * area.Height);
+                break;
+            default:
+                if (!set.Images.TryGetValue(s.ImageId, out var image)) return null;
+                float w = s.Width * area.Width;
+                size = new SizeF(w, w * image.Aspect);
+                break;
+        }
+        var c = StickerCenter(s, area);
+        return new RectangleF(c.X - size.Width / 2, c.Y - size.Height / 2, size.Width, size.Height);
     }
+
+    static PointF StickerCenter(Sticker s, RectangleF area) => new(area.X + s.X * area.Width, area.Y + s.Y * area.Height);
 
     static PointF Center(RectangleF r) => new(r.X + r.Width / 2, r.Y + r.Height / 2);
 
@@ -168,37 +219,67 @@ static class Decor
     }
 
     /// <summary>Corners of a turned sticker: top-left, top-right, bottom-right, bottom-left.</summary>
-    public static PointF[] StickerCorners(Sticker s, ImageAsset image, RectangleF area)
+    public static PointF[]? StickerCorners(Sticker s, DecorSet set, RectangleF area)
     {
-        var r = StickerRect(s, image, area);
+        if (StickerRect(s, set, area) is not { } r) return null;
         var c = Center(r);
         return [Rotate(r.Location, c, s.Angle), Rotate(new(r.Right, r.Top), c, s.Angle),
             Rotate(new(r.Right, r.Bottom), c, s.Angle), Rotate(new(r.Left, r.Bottom), c, s.Angle)];
     }
 
     /// <summary>Whether <paramref name="p"/> lands on the sticker, taking its turn into account.</summary>
-    public static bool StickerContains(Sticker s, ImageAsset image, RectangleF area, PointF p, float slack = 0)
+    public static bool StickerContains(Sticker s, DecorSet set, RectangleF area, PointF p, float slack = 0)
     {
-        var r = StickerRect(s, image, area);
+        if (StickerRect(s, set, area) is not { } r) return false;
         return RectangleF.Inflate(r, slack, slack).Contains(Rotate(p, Center(r), -s.Angle));
     }
 
-    /// <summary>Watermark text as a path at the origin, with its tight bounds.</summary>
-    static GraphicsPath TextPath(Watermark w, RectangleF area, out RectangleF bounds)
+    static FontFamily Family(string name)
+    {
+        try { return new FontFamily(name); }
+        catch (ArgumentException) { return new FontFamily("Segoe UI"); } // font uninstalled since it was chosen
+    }
+
+    /// <summary>
+    /// Text as a path at the origin, with its tight bounds and the height of its lines (ascent to descent, so the same for
+    /// every text in a font). Centred text is centred on x = 0.
+    /// </summary>
+    static GraphicsPath TextPath(string text, string familyName, FontStyle style, float em, bool centered,
+        out RectangleF bounds, out float linesHeight)
     {
         var path = new GraphicsPath();
-        float em = Math.Max(4, w.SizePercent / 100f * area.Height);
-        FontFamily family;
-        try { family = new FontFamily(w.FontFamily); }
-        catch (ArgumentException) { family = new FontFamily("Segoe UI"); } // font uninstalled since it was chosen
-        using (family)
+        using (var family = Family(familyName))
         {
-            var style = w.FontStyle;
             if (!family.IsStyleAvailable(style)) style = family.IsStyleAvailable(FontStyle.Regular) ? FontStyle.Regular : FontStyle.Bold;
-            using var sf = new StringFormat(StringFormat.GenericTypographic) { FormatFlags = StringFormatFlags.NoWrap };
-            path.AddString(w.Text.Trim(), family, (int)style, em, PointF.Empty, sf);
+            float unit = em / family.GetEmHeight(style);
+            int lines = text.Split('\n').Length;
+            linesHeight = (lines - 1) * family.GetLineSpacing(style) * unit + (family.GetCellAscent(style) + family.GetCellDescent(style)) * unit;
+            using var sf = new StringFormat(StringFormat.GenericTypographic)
+            {
+                FormatFlags = StringFormatFlags.NoWrap,
+                Alignment = centered ? StringAlignment.Center : StringAlignment.Near,
+            };
+            if (text.Length > 0) path.AddString(text, family, (int)style, em, PointF.Empty, sf);
         }
-        bounds = path.GetBounds();
+        bounds = path.PointCount > 0 ? path.GetBounds() : RectangleF.Empty;
+        return path;
+    }
+
+    static float TextEm(Sticker s, RectangleF area) => Math.Max(4, s.Style.Size * area.Height);
+
+    /// <summary>
+    /// A text item as a path around the origin, with the box it takes up: its backdrop when it has one. The box spans whole
+    /// lines rather than the inked letters, so items in one font line up whatever their letters.
+    /// </summary>
+    static GraphicsPath TextBlock(Sticker s, RectangleF area, out RectangleF box)
+    {
+        float em = TextEm(s, area);
+        var path = TextPath(s.Text.Trim(), s.Style.FontFamily, s.Style.FontStyle, em, centered: true, out var b, out float height);
+        box = b.IsEmpty
+            ? new RectangleF(-em / 2, 0, em, height) // blank text keeps a box so it can still be picked and typed into
+            : RectangleF.FromLTRB(b.Left, Math.Min(0, b.Top), b.Right, Math.Max(height, b.Bottom));
+        box = s.Style.Box ? RectangleF.Inflate(box, em * 0.5f, em * 0.25f)
+            : s.Style.Outline ? RectangleF.Inflate(box, em * 0.06f, em * 0.06f) : box;
         return path;
     }
 
@@ -211,9 +292,12 @@ static class Decor
             float width = w.SizePercent / 100f * area.Width;
             return new SizeF(width, width * image.Aspect);
         }
-        using var path = TextPath(w, area, out var b);
+        using var path = WatermarkPath(w, area, out var b);
         return b.Size;
     }
+
+    static GraphicsPath WatermarkPath(Watermark w, RectangleF area, out RectangleF bounds) =>
+        TextPath(w.Text.Trim(), w.FontFamily, w.FontStyle, Math.Max(4, w.SizePercent / 100f * area.Height), centered: false, out bounds, out _);
 
     public static RectangleF WatermarkRect(Watermark w, ImageAsset? image, RectangleF area)
     {
@@ -246,13 +330,16 @@ static class Decor
         return Math.Clamp((int)Math.Round(w.SizePercent * width / current.Width), 1, 100);
     }
 
+    static int Alpha(int opacity) => (int)Math.Round(255 * Math.Clamp(opacity, 0, 100) / 100.0);
+
     /// <summary>
     /// Draws the stickers listed for a frame, then the watermark. <paramref name="bitmapFor"/> turns an image (keyed by
     /// asset id, null for the watermark image) into a bitmap for the given drawn size, so callers can cache bitmaps in
     /// whatever way suits their thread; with <paramref name="disposeBitmaps"/> each one is disposed after drawing.
+    /// <paramref name="pixels"/> supplies the frame under the decorations, asked for only when a mosaic needs it.
     /// </summary>
     public static void Draw(Graphics g, RectangleF area, DecorSet set, int[]? frameStickers,
-        Func<int?, ImageAsset, Size, Bitmap> bitmapFor, bool disposeBitmaps)
+        Func<int?, ImageAsset, Size, Bitmap> bitmapFor, bool disposeBitmaps, Func<PixelSource>? pixels = null)
     {
         void Image(int? id, ImageAsset asset, RectangleF r, int opacity, float angle = 0)
         {
@@ -286,17 +373,27 @@ static class Decor
         g.SetClip(area);
 
         if (frameStickers != null)
+        {
+            // Mosaics hide what was filmed, so they go first: they never blur the text and images placed over them.
+            PixelSource? source = null;
+            if (pixels != null)
+                foreach (var id in frameStickers)
+                    if (set.Stickers.TryGetValue(id, out var s) && s.Kind == StickerKind.Mosaic)
+                        DrawMosaic(g, s, area, source ??= pixels());
             foreach (var id in frameStickers)
             {
-                if (!set.Stickers.TryGetValue(id, out var s) || !set.Images.TryGetValue(s.ImageId, out var asset)) continue;
-                Image(s.ImageId, asset, StickerRect(s, asset, area), s.Opacity, s.Angle);
+                if (!set.Stickers.TryGetValue(id, out var s)) continue;
+                if (s.Kind == StickerKind.Text) DrawText(g, s, area);
+                else if (s.Kind == StickerKind.Image && set.Images.TryGetValue(s.ImageId, out var asset))
+                    Image(s.ImageId, asset, StickerRect(s, set, area)!.Value, s.Opacity, s.Angle);
             }
+        }
 
         if (set.HasWatermark)
         {
             var w = set.Watermark;
             if (w.IsImage) Image(null, set.WatermarkImage!, WatermarkRect(w, set.WatermarkImage, area), w.Opacity);
-            else DrawText(g, w, area);
+            else DrawWatermarkText(g, w, area);
         }
         g.Restore(state);
     }
@@ -314,22 +411,102 @@ static class Decor
             new RectangleF(0, 0, bmp.Width, bmp.Height), GraphicsUnit.Pixel, attrs);
     }
 
-    static void DrawText(Graphics g, Watermark w, RectangleF area)
+    /// <summary>Fills letters, under a dark outline that keeps them readable over any background when asked.</summary>
+    static void FillLetters(Graphics g, GraphicsPath path, int argb, int alpha, bool outline, float em)
     {
-        using var path = TextPath(w, area, out var b);
+        if (outline)
+        {
+            using var pen = new Pen(Color.FromArgb(alpha * 3 / 4, 0, 0, 0), Math.Max(1.5f, em * 0.12f)) { LineJoin = LineJoin.Round };
+            g.DrawPath(pen, path);
+        }
+        using var fill = new SolidBrush(Color.FromArgb(alpha, Color.FromArgb(argb)));
+        g.FillPath(fill, path);
+    }
+
+    static void DrawWatermarkText(Graphics g, Watermark w, RectangleF area)
+    {
+        using var path = WatermarkPath(w, area, out var b);
         var r = WatermarkRect(w, null, area);
         using var move = new Matrix();
         move.Translate(r.X - b.X, r.Y - b.Y);
         path.Transform(move);
+        FillLetters(g, path, w.ColorArgb, Alpha(w.Opacity), w.Outline, w.SizePercent / 100f * area.Height);
+    }
 
-        int alpha = (int)Math.Round(255 * Math.Clamp(w.Opacity, 0, 100) / 100.0);
-        if (w.Outline)
+    static void DrawText(Graphics g, Sticker s, RectangleF area)
+    {
+        using var path = TextBlock(s, area, out var box);
+        float em = TextEm(s, area);
+        int alpha = Alpha(s.Opacity);
+        var state = g.Save();
+        // The box's centre goes on the sticker's centre, turned about it.
+        var c = StickerCenter(s, area);
+        g.TranslateTransform(c.X, c.Y);
+        if (s.Angle % 360 != 0) g.RotateTransform(s.Angle);
+        g.TranslateTransform(-(box.X + box.Width / 2), -(box.Y + box.Height / 2));
+        if (s.Style.Box)
         {
-            float em = w.SizePercent / 100f * area.Height;
-            using var pen = new Pen(Color.FromArgb(alpha * 3 / 4, 0, 0, 0), Math.Max(1.5f, em * 0.12f)) { LineJoin = LineJoin.Round };
-            g.DrawPath(pen, path);
+            using var backdrop = Theme.RoundRect(box, em * 0.3f);
+            using var bg = new SolidBrush(Color.FromArgb(alpha * 205 / 255, 16, 16, 20));
+            g.FillPath(bg, backdrop);
         }
-        using var fill = new SolidBrush(Color.FromArgb(alpha, Color.FromArgb(w.ColorArgb)));
-        g.FillPath(fill, path);
+        FillLetters(g, path, s.Style.ColorArgb, alpha, s.Style.Outline, em);
+        g.Restore(state);
+    }
+
+    /// <summary>
+    /// Pixelates the frame under a mosaic: each cell of a grid fixed to the frame (so cells stay put while the patch moves)
+    /// is filled with the average colour of the pixels it covers.
+    /// </summary>
+    static void DrawMosaic(Graphics g, Sticker s, RectangleF area, PixelSource px)
+    {
+        if (StickerCorners(s, DecorSet.Empty, area) is not { } corners || px.Region.Width <= 0 || px.Region.Height <= 0) return;
+        float cell = Math.Max(s.Cell * CellStep * Math.Min(area.Width, area.Height), 2 * area.Width / px.Region.Width);
+        float left = Math.Max(area.Left, corners.Min(p => p.X)), right = Math.Min(area.Right, corners.Max(p => p.X));
+        float top = Math.Max(area.Top, corners.Min(p => p.Y)), bottom = Math.Min(area.Bottom, corners.Max(p => p.Y));
+        if (right <= left || bottom <= top) return;
+
+        var state = g.Save();
+        using (var clip = new GraphicsPath())
+        {
+            clip.AddPolygon(corners);
+            g.SetClip(clip, CombineMode.Intersect);
+        }
+        // Without anti-aliasing neighbouring cells meet exactly, with no seams between them.
+        g.SmoothingMode = SmoothingMode.None;
+        g.PixelOffsetMode = PixelOffsetMode.Half;
+        int alpha = Alpha(s.Opacity);
+        float kx = px.Region.Width / area.Width, ky = px.Region.Height / area.Height;
+        int i0 = (int)Math.Floor((left - area.X) / cell), i1 = (int)Math.Ceiling((right - area.X) / cell);
+        int j0 = (int)Math.Floor((top - area.Y) / cell), j1 = (int)Math.Ceiling((bottom - area.Y) / cell);
+        var bgra = px.Bgra;
+        using var brush = new SolidBrush(Color.Black);
+        for (int j = j0; j < j1; j++)
+        {
+            float y0 = area.Y + j * cell, y1 = Math.Min(y0 + cell, area.Bottom);
+            int sy0 = Math.Clamp((int)((y0 - area.Y) * ky), 0, px.Region.Height - 1);
+            int sy1 = Math.Clamp((int)Math.Ceiling((y1 - area.Y) * ky), sy0 + 1, px.Region.Height);
+            for (int i = i0; i < i1; i++)
+            {
+                float x0 = area.X + i * cell, x1 = Math.Min(x0 + cell, area.Right);
+                int sx0 = Math.Clamp((int)((x0 - area.X) * kx), 0, px.Region.Width - 1);
+                int sx1 = Math.Clamp((int)Math.Ceiling((x1 - area.X) * kx), sx0 + 1, px.Region.Width);
+                long b = 0, gr = 0, r = 0;
+                for (int y = sy0; y < sy1; y++)
+                {
+                    int o = ((px.Region.Y + y) * px.Width + px.Region.X + sx0) * 4;
+                    for (int x = sx0; x < sx1; x++, o += 4)
+                    {
+                        b += bgra[o];
+                        gr += bgra[o + 1];
+                        r += bgra[o + 2];
+                    }
+                }
+                long n = (long)(sy1 - sy0) * (sx1 - sx0);
+                brush.Color = Color.FromArgb(alpha, (int)(r / n), (int)(gr / n), (int)(b / n));
+                g.FillRectangle(brush, x0, y0, x1 - x0, y1 - y0);
+            }
+        }
+        g.Restore(state);
     }
 }

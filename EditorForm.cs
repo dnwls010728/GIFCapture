@@ -3,10 +3,10 @@ using System.Diagnostics;
 
 namespace GifCapture;
 
-/// <param name="Stickers">Ids of the stickers shown on this frame, drawn in order; null = none.</param>
-readonly record struct EditFrame(int Source, int DelayMs, string? Caption = null, int[]? Stickers = null);
+/// <param name="Stickers">Ids of the images, texts and mosaics shown on this frame, drawn in order; null = none.</param>
+readonly record struct EditFrame(int Source, int DelayMs, int[]? Stickers = null);
 
-/// <summary>Post-recording editor: browse, trim, retime, caption, crop and rotate frames, tune export settings, then save.</summary>
+/// <summary>Post-recording editor: browse, trim, retime, decorate, crop and rotate frames, tune export settings, then save.</summary>
 sealed class EditorForm : Form
 {
     sealed record Snapshot(EditFrame[] Frames, Rectangle Crop, int Angle, bool Flip, int Current, Watermark Watermark, Sticker[] Stickers);
@@ -41,6 +41,9 @@ sealed class EditorForm : Form
     readonly Dictionary<int, ImageAsset> _images = [];
     int _nextId = 1;
     bool _syncingDecor;
+    TextStyle _textStyle;     // look of the next text added
+    int? _textBoxOwner;       // text item whose words the text box shows; null = a draft for the next one
+    int _layerLayout = -1;    // which set of item controls is laid out (see LayoutItemControls)
 
     // Rapid edits of one kind (slider drags, typing) within a moment share an undo step.
     Snapshot? _mergeSnap;
@@ -100,7 +103,18 @@ sealed class EditorForm : Form
     readonly AnchorPicker _wmAnchor = new();
     readonly ToggleSwitch _wmOutline = new() { Text = L.T("외곽선") };
     readonly PillButton _stickerAddBtn = new() { Text = L.T("이미지 추가") };
-    readonly PillButton _stickerDeleteBtn = new() { Text = L.T("이미지 삭제"), Danger = true };
+    readonly PillButton _textAddBtn = new() { Text = L.T("텍스트 추가") };
+    readonly PillButton _mosaicAddBtn = new() { Text = L.T("모자이크 추가") };
+    readonly PillButton _stickerDeleteBtn = new() { Text = L.T("삭제"), Danger = true };
+    readonly Label _pickLabel = new() { ForeColor = Theme.Muted, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
+    readonly TextBox _textBox = new();
+    readonly PillButton _textFontBtn = new();
+    readonly SwatchButton _textColorBtn = new() { Text = L.T("색상") };
+    readonly ThemedSlider _textSize = new() { Text = L.T("글자 크기"), Minimum = 2, Maximum = 30, Suffix = "%" };
+    readonly ToggleSwitch _textOutline = new() { Text = L.T("외곽선") };
+    readonly ToggleSwitch _textBackdrop = new() { Text = L.T("배경 상자") };
+    readonly ThemedSlider _mosaicCell = new() { Text = L.T("칸 크기"), Minimum = 1, Maximum = 10 };
+    readonly Label _layerHint = Theme.MutedLabel(L.T("텍스트는 두 번 클릭해 고치기 · 이미지는 Ctrl+V 붙여넣기, 끌어다 놓기 · Del 삭제"), Rectangle.Empty);
     readonly PillButton _stickerShowBtn = new() { Text = L.T("선택 프레임에도 표시") };
     readonly PillButton _stickerHideBtn = new() { Text = L.T("선택 프레임에서 빼기") };
     readonly ThemedSlider _stickerOpacity = new() { Text = L.T("불투명도"), Minimum = 10, Maximum = 100, Step = 5, Suffix = "%" };
@@ -117,9 +131,6 @@ sealed class EditorForm : Form
     readonly PillButton _delayBtn = new() { Text = L.T("선택에 적용") };
     readonly PillButton _slowerBtn = new() { Text = L.T("느리게 ×0.5") };
     readonly PillButton _fasterBtn = new() { Text = L.T("빠르게 ×2") };
-    readonly TextBox _captionBox = new();
-    readonly PillButton _captionBtn = new() { Text = L.T("선택에 자막") };
-    readonly PillButton _captionClearBtn = new() { Text = L.T("자막 지우기") };
     readonly PillButton _cropBtn = new() { Text = L.T("자르기") };
     readonly PillButton _cropResetBtn = new() { Text = L.T("자르기 해제") };
     readonly PillButton _rotateBtn = new() { Text = L.T("90° 회전") };
@@ -166,6 +177,7 @@ sealed class EditorForm : Form
         _srcSize = store.FrameSize;
         _frames = Enumerable.Range(0, store.Count).Select(i => new EditFrame(i, Math.Max(GifExporter.MinDelayMs, i < delays.Count ? delays[i] : 100))).ToList();
         _watermark = _settings.Watermark;
+        _textStyle = _settings.TextStyle;
         _view = new Bitmap(_srcSize.Width, _srcSize.Height, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
         _thumbBox = new Size((int)(220 * DeviceDpi / 96f), (int)(124 * DeviceDpi / 96f));
 
@@ -198,8 +210,9 @@ sealed class EditorForm : Form
         _timeline.Aspect = (float)_srcSize.Width / _srcSize.Height;
         _timeline.ThumbnailFor = ThumbnailAt;
         _timeline.DelayFor = i => _frames[i].DelayMs;
-        _timeline.HasCaption = i => !string.IsNullOrWhiteSpace(_frames[i].Caption);
-        _timeline.HasStickers = i => _frames[i].Stickers is { Length: > 0 };
+        _timeline.HasText = i => HasKind(i, StickerKind.Text);
+        _timeline.HasImages = i => HasKind(i, StickerKind.Image);
+        _timeline.HasMosaic = i => HasKind(i, StickerKind.Mosaic);
         _timeline.Selection = _sel;
         _sel.Add(0);
 
@@ -277,15 +290,9 @@ sealed class EditorForm : Form
         ep.Controls.Add(Theme.SectionLabel(L.T("재생 시간"), new Rectangle(L0 - 1, 206, Full, 24)));
         Place(ep, _delayBox, L0, 234, W); Place(ep, _delayBtn, R, 234, W);
         Place(ep, _slowerBtn, L0, 276, W); Place(ep, _fasterBtn, R, 276, W);
-        ep.Controls.Add(Theme.SectionLabel(L.T("자막"), new Rectangle(L0 - 1, 324, Full, 24)));
-        Theme.StyleTextBox(_captionBox);
-        _captionBox.Bounds = new Rectangle(L0, 352, Full, 30);
-        _captionBox.PlaceholderText = L.T("설명 문구 입력");
-        ep.Controls.Add(_captionBox);
-        Place(ep, _captionBtn, L0, 390, W); Place(ep, _captionClearBtn, R, 390, W);
-        ep.Controls.Add(Theme.SectionLabel(L.T("자르기 · 회전"), new Rectangle(L0 - 1, 438, Full, 24)));
-        Place(ep, _cropBtn, L0, 466, W); Place(ep, _cropResetBtn, R, 466, W);
-        Place(ep, _rotateBtn, L0, 508, W); Place(ep, _flipBtn, R, 508, W);
+        ep.Controls.Add(Theme.SectionLabel(L.T("자르기 · 회전"), new Rectangle(L0 - 1, 324, Full, 24)));
+        Place(ep, _cropBtn, L0, 352, W); Place(ep, _cropResetBtn, R, 352, W);
+        Place(ep, _rotateBtn, L0, 394, W); Place(ep, _flipBtn, R, 394, W);
 
         // Decorate tab: watermark on every frame, images on chosen frames
         var dp = _decorPanel;
@@ -306,15 +313,16 @@ sealed class EditorForm : Form
         wmHint.TextAlign = ContentAlignment.TopLeft;
         dp.Controls.AddRange([_wmOn, _wmKind, _wmText, _wmImageBtn, _wmFontBtn, _wmColorBtn, _wmSize, _wmOpacity, _wmAnchor, _wmOutline, wmHint]);
 
-        dp.Controls.Add(Theme.SectionLabel(L.T("이미지 삽입"), new Rectangle(L0 - 1, 382, Full, 24)));
-        Place(dp, _stickerAddBtn, L0, 408, W); Place(dp, _stickerDeleteBtn, R, 408, W);
-        Place(dp, _stickerShowBtn, L0, 450, Full);
-        Place(dp, _stickerHideBtn, L0, 492, Full);
-        _stickerOpacity.Bounds = new Rectangle(L0, 534, W, 50);
-        _stickerAngle.Bounds = new Rectangle(R, 534, W, 50);
-        var stickerHint = Theme.MutedLabel(L.T("Ctrl+V 붙여넣기 · 끌어다 놓기 · Del 삭제"), new Rectangle(L0, 588, Full, 24));
-        stickerHint.TextAlign = ContentAlignment.TopLeft;
-        dp.Controls.AddRange([_stickerOpacity, _stickerAngle, stickerHint]);
+        // Items on chosen frames. Only the rows for what is picked are shown; LayoutItemControls stacks them.
+        dp.Controls.Add(Theme.SectionLabel(L.T("텍스트 · 이미지 · 모자이크"), new Rectangle(L0 - 1, 382, Full, 24)));
+        Place(dp, _textAddBtn, L0, 408, W); Place(dp, _stickerAddBtn, R, 408, W);
+        Place(dp, _mosaicAddBtn, L0, 450, W); Place(dp, _stickerDeleteBtn, R, 450, W);
+        Theme.StyleTextBox(_textBox);
+        _textBox.PlaceholderText = L.T("텍스트 입력 후 Enter");
+        _layerHint.TextAlign = ContentAlignment.TopLeft;
+        dp.Controls.AddRange([_pickLabel, _textBox, _textFontBtn, _textColorBtn, _textSize, _textOutline, _textBackdrop, _mosaicCell,
+            _stickerOpacity, _stickerAngle, _stickerShowBtn, _stickerHideBtn, _layerHint]);
+        LayoutItemControls(null);
 
         // Export tab
         var xp = _exportPanel;
@@ -374,7 +382,7 @@ sealed class EditorForm : Form
         _tips.SetToolTip(_redoBtn, "Ctrl+Y");
         _tips.SetToolTip(_fitBtn, L.T("창에 맞추기 (Ctrl+0)"));
         _tips.SetToolTip(_actualBtn, L.T("실제 크기 (Ctrl+1). 미리보기에서 휠로 확대/축소, 드래그로 이동"));
-        _tips.SetToolTip(_keysBtn, L.T("Space  재생 / 일시정지\n←  →  이전 / 다음 프레임   (Shift: 선택 확장)\nHome  End  처음 / 끝\nShift·Ctrl + 클릭, 드래그  여러 개 선택\nCtrl+A  전체 선택     Esc  선택 해제\nDel  삭제 (미리보기에서 고른 이미지가 있으면 그 이미지)\nCtrl+D  복제     Ctrl+V  이미지 붙여넣기\nCtrl+Z / Ctrl+Y  실행 취소 / 다시 실행\n휠  확대/축소     Ctrl+0  맞춤     Ctrl+1  100%\nCtrl+S  저장     Ctrl+Shift+C  복사"));
+        _tips.SetToolTip(_keysBtn, L.T("Space  재생 / 일시정지\n←  →  이전 / 다음 프레임   (Shift: 선택 확장)\nHome  End  처음 / 끝\nShift·Ctrl + 클릭, 드래그  여러 개 선택\nCtrl+A  전체 선택     Esc  선택 해제\nDel  삭제 (미리보기에서 고른 항목이 있으면 그 항목)\nCtrl+D  복제     Ctrl+V  이미지 붙여넣기\nCtrl+Z / Ctrl+Y  실행 취소 / 다시 실행\n휠  확대/축소     Ctrl+0  맞춤     Ctrl+1  100%\nCtrl+S  저장     Ctrl+Shift+C  복사"));
         _tips.SetToolTip(_deleteBtn, L.T("선택한 프레임 삭제 (Del)"));
         _tips.SetToolTip(_keepBtn, L.T("선택하지 않은 프레임을 모두 삭제"));
         _tips.SetToolTip(_trimStartBtn, L.T("현재 프레임보다 앞의 프레임을 모두 삭제"));
@@ -386,7 +394,6 @@ sealed class EditorForm : Form
         _tips.SetToolTip(_delayBtn, L.T("선택한 프레임에 표시 시간 적용 (Enter)"));
         _tips.SetToolTip(_slowerBtn, L.T("표시 시간을 두 배로.\n여러 개 선택 시 선택 범위만."));
         _tips.SetToolTip(_fasterBtn, L.T("표시 시간을 절반으로.\n여러 개 선택 시 선택 범위만."));
-        _tips.SetToolTip(_captionBtn, L.T("선택한 프레임 아래쪽에 자막을 넣습니다 (Enter)."));
         _tips.SetToolTip(_cropBtn, L.T("미리보기에서 드래그해 남길 영역을 지정합니다."));
         _tips.SetToolTip(_preset, L.T("문서용: 작은 용량 · 10fps\nSNS용: 가로 1280px 이하 · 15fps\n게임용: 높은 화질 · 30fps"));
         _tips.SetToolTip(_quality, L.T("낮추면 색 수를 줄이고 미세한 변화를 무시해 용량이 줄어듭니다."));
@@ -408,11 +415,19 @@ sealed class EditorForm : Form
         _tips.SetToolTip(_wmAnchor, L.T("워터마크를 붙일 위치. 고르면 끌어 옮긴 위치는 초기화됩니다.\n미리보기에서 끌어 옮기고 모서리 핸들로 크기를 바꿀 수 있습니다."));
         _tips.SetToolTip(_wmOutline, L.T("글자 둘레에 어두운 테두리를 그려 어떤 배경에서도 잘 보이게 합니다."));
         _tips.SetToolTip(_stickerAddBtn, L.T("이미지 파일을 골라 선택한 프레임에 넣습니다."));
-        _tips.SetToolTip(_stickerDeleteBtn, L.T("고른 이미지를 모든 프레임에서 지웁니다 (Del)."));
-        _tips.SetToolTip(_stickerShowBtn, L.T("고른 이미지를 타임라인에서 선택한 프레임에도 표시합니다."));
-        _tips.SetToolTip(_stickerAngle, L.T("고른 이미지를 돌립니다. 미리보기에서 위쪽 동그란 핸들을 끌어도 되고, Shift를 누르면 15° 단위로 맞춰집니다."));
-        _tips.SetToolTip(_stickerHideBtn, L.T("고른 이미지를 타임라인에서 선택한 프레임에서만 뺍니다."));
-        _tips.SetToolTip(_captionClearBtn, L.T("선택한 프레임의 자막을 지웁니다."));
+        _tips.SetToolTip(_textAddBtn, L.T("선택한 프레임 아래쪽에 텍스트를 넣습니다. 자막도 이것으로 넣습니다.\n미리보기에서 옮기고, 크기를 바꾸고, 돌릴 수 있습니다."));
+        _tips.SetToolTip(_mosaicAddBtn, L.T("선택한 프레임의 일부를 모자이크로 가립니다.\n미리보기에서 옮기고 모서리 핸들로 영역을 바꿉니다."));
+        _tips.SetToolTip(_stickerDeleteBtn, L.T("고른 항목을 모든 프레임에서 지웁니다 (Del)."));
+        _tips.SetToolTip(_stickerShowBtn, L.T("고른 항목을 타임라인에서 선택한 프레임에도 표시합니다."));
+        _tips.SetToolTip(_stickerAngle, L.T("고른 항목을 돌립니다. 미리보기에서 위쪽 동그란 핸들을 끌어도 되고, Shift를 누르면 15° 단위로 맞춰집니다."));
+        _tips.SetToolTip(_stickerHideBtn, L.T("고른 항목을 타임라인에서 선택한 프레임에서만 뺍니다."));
+        _tips.SetToolTip(_textBox, L.T("고른 텍스트를 고칩니다. 아무것도 고르지 않았으면 Enter로 새 텍스트를 넣습니다.\n미리보기에서 텍스트를 두 번 클릭해도 고칠 수 있습니다."));
+        _tips.SetToolTip(_textFontBtn, L.T("텍스트 글꼴과 굵기를 고릅니다."));
+        _tips.SetToolTip(_textColorBtn, L.T("텍스트 색을 고릅니다."));
+        _tips.SetToolTip(_textSize, L.T("글자 높이 (화면 높이 대비). 미리보기에서 모서리 핸들을 끌어도 됩니다."));
+        _tips.SetToolTip(_textBackdrop, L.T("글자 뒤에 어두운 상자를 깔아 자막처럼 보이게 합니다."));
+        _tips.SetToolTip(_textOutline, L.T("글자 둘레에 어두운 테두리를 그려 어떤 배경에서도 잘 보이게 합니다."));
+        _tips.SetToolTip(_mosaicCell, L.T("모자이크 한 칸의 크기. 클수록 알아보기 어렵습니다."));
         _tips.SetToolTip(_cropResetBtn, L.T("자르기를 없애고 전체 화면으로 되돌립니다."));
         _tips.SetToolTip(_rotateBtn, L.T("시계 방향으로 90° 돌립니다."));
         _tips.SetToolTip(_flipBtn, L.T("좌우를 뒤집습니다."));
@@ -482,6 +497,29 @@ sealed class EditorForm : Form
         _wmColorBtn.Click += (_, _) => ChooseWatermarkColor();
         _wmImageBtn.Click += (_, _) => ChooseWatermarkImage();
         _stickerAddBtn.Click += (_, _) => { if (PickImage(L.T("넣을 이미지")) is { } a) AddSticker(a); };
+        _textAddBtn.Click += (_, _) => AddText(_textBoxOwner == null ? _textBox.Text : "");
+        _mosaicAddBtn.Click += (_, _) => AddMosaic();
+        _textBox.TextChanged += (_, _) =>
+        {
+            if (_syncingDecor || _textBoxOwner is not { } id || !_stickers.TryGetValue(id, out var s)) return;
+            MergedEdit(("text", id), () => _stickers[id] = s with { Text = _textBox.Text });
+        };
+        _textFontBtn.Click += (_, _) => ChooseTextFont();
+        _textColorBtn.Click += (_, _) => ChooseTextColor();
+        _textSize.ValueChanged += (_, _) => SetTextStyle(CurrentTextStyle() with { Size = _textSize.Value / 100f });
+        _textOutline.CheckedChanged += (_, _) => SetTextStyle(CurrentTextStyle() with { Outline = _textOutline.Checked });
+        _textBackdrop.CheckedChanged += (_, _) => SetTextStyle(CurrentTextStyle() with { Box = _textBackdrop.Checked });
+        _mosaicCell.ValueChanged += (_, _) =>
+        {
+            if (_syncingDecor || Picked is not { Kind: StickerKind.Mosaic } s) return;
+            MergedEdit(("cell", s.Id), () => _stickers[s.Id] = s with { Cell = _mosaicCell.Value });
+        };
+        _canvas.StickerActivated += id =>
+        {
+            if (!_stickers.TryGetValue(id, out var s) || s.Kind != StickerKind.Text) return;
+            _textBox.Focus();
+            _textBox.SelectAll();
+        };
         _stickerDeleteBtn.Click += (_, _) => { if (_canvas.SelectedSticker is { } id) DeleteSticker(id); };
         _stickerShowBtn.Click += (_, _) => { if (_canvas.SelectedSticker is { } id) ShowStickerOnSelection(id); };
         _stickerHideBtn.Click += (_, _) => { if (_canvas.SelectedSticker is { } id) HideStickerFromSelection(id); };
@@ -500,7 +538,11 @@ sealed class EditorForm : Form
             if (sticker != null || watermark) _tabs.Value = 1; // bring the controls for what was picked into view
             UpdateDecorControls();
         };
-        _canvas.StickerEdited += s => Apply(L.T("이미지 위치·크기·각도 바꿈"), () => { _stickers[s.Id] = s; return true; });
+        _canvas.StickerEdited += s =>
+        {
+            if (s.Kind == StickerKind.Text) _textStyle = _settings.TextStyle = s.Style; // a resized text sets the size of the next
+            Apply(L.F("{0} 위치·크기·각도 바꿈", KindName(s.Kind)), () => { _stickers[s.Id] = s; return true; });
+        };
         _canvas.WatermarkEdited += w =>
         {
             SetWatermark(w);
@@ -525,8 +567,6 @@ sealed class EditorForm : Form
         _delayBtn.Click += (_, _) => { _delayBox.Commit(); SetDelay(_delayBox.Value); };
         _slowerBtn.Click += (_, _) => ChangeSpeed(0.5);
         _fasterBtn.Click += (_, _) => ChangeSpeed(2);
-        _captionBtn.Click += (_, _) => SetCaption(_captionBox.Text.Trim());
-        _captionClearBtn.Click += (_, _) => SetCaption(null);
         _cropBtn.Click += (_, _) => { if (_canvas.CropMode) CommitCrop(); else EnterCropMode(); };
         _cropResetBtn.Click += (_, _) => { if (_canvas.CropMode) CancelCrop(); else ResetCrop(); };
         _rotateBtn.Click += (_, _) => Transform(L.T("90° 회전"), () => _angle = (_angle + (_flip ? 270 : 90)) % 360);
@@ -660,7 +700,6 @@ sealed class EditorForm : Form
             _canvas.FrameUpdated();
         }
         if (_playing) Prefetch();
-        _canvas.Caption = _frames[_current].Caption;
         _canvas.FrameStickers = _frames[_current].Stickers;
         _canvas.Invalidate();
         _timeline.Current = _current;
@@ -676,7 +715,6 @@ sealed class EditorForm : Form
         _posLabel.Text = $"{_current + 1} / {_frames.Count}";
         _timeLabel.Text = L.F("{0:0.00} / {1:0.00}초", before / 1000.0, total / 1000.0);
         if (!_playing && !_delayBox.IsEditing) _delayBox.Value = _frames[_current].DelayMs;
-        if (!_playing && !_captionBox.Focused) _captionBox.Text = _frames[_current].Caption ?? "";
 
         int count = Targets().Count;
         bool multi = count > 1;
@@ -1127,22 +1165,6 @@ sealed class EditorForm : Form
         });
     }
 
-    void SetCaption(string? text)
-    {
-        if (text is { Length: 0 }) text = null;
-        var t = Targets();
-        if (text == null && t.All(i => _frames[i].Caption == null))
-        {
-            Notify(L.T("선택한 프레임에 자막이 없습니다"), error: true);
-            return;
-        }
-        Apply(text == null ? L.F("{0}개 프레임 자막 지움", t.Count) : L.F("{0}개 프레임에 자막 넣음", t.Count), () =>
-        {
-            foreach (var i in t) _frames[i] = _frames[i] with { Caption = text };
-            return true;
-        });
-    }
-
     void Transform(string done, Action change)
     {
         Apply(done, () =>
@@ -1278,14 +1300,42 @@ sealed class EditorForm : Form
     /// <summary>Places a new image in the middle of the selected frames, at its own size if that fits.</summary>
     void AddSticker(ImageAsset asset)
     {
-        var t = Targets();
         var output = CurrentOptions().OutputSize(_srcSize);
         float width = Math.Min(asset.Size.Width / (float)output.Width, 0.4f);
         width = Math.Min(width, 0.6f * output.Height / (asset.Aspect * output.Width)); // keep tall images inside the frame too
         int imageId = _nextId++;
         _images[imageId] = asset;
-        var sticker = new Sticker(_nextId++, imageId, 0.5f, 0.5f, Math.Max(width, 0.02f));
-        Apply(L.F("{0}개 프레임에 이미지 넣음", t.Count), () =>
+        AddItem(new Sticker(_nextId++, imageId, 0.5f, 0.5f, Math.Max(width, 0.02f)));
+    }
+
+    /// <summary>Puts text along the bottom of the selected frames, where a caption goes, in the last look used.</summary>
+    void AddText(string text)
+    {
+        text = text.Trim();
+        bool placeholder = text.Length == 0;
+        if (placeholder) text = L.T("텍스트");
+        var output = new RectangleF(PointF.Empty, CurrentOptions().OutputSize(_srcSize));
+        var sticker = new Sticker(_nextId++, 0, 0.5f, 0.5f, 0) { Kind = StickerKind.Text, Text = text, Style = _textStyle };
+        float h = Decor.StickerRect(sticker, DecorSet.Empty, output)!.Value.Height / output.Height;
+        AddItem(sticker with { Y = Math.Max(h / 2, 1 - h / 2 - 0.04f) });
+        // Straight on to typing: a placeholder is selected so the first key replaces it.
+        _textBox.Focus();
+        if (placeholder) _textBox.SelectAll();
+        else _textBox.Select(_textBox.TextLength, 0);
+    }
+
+    /// <summary>Covers a patch in the middle of the selected frames, to be dragged over whatever should not be seen.</summary>
+    void AddMosaic()
+    {
+        var output = CurrentOptions().OutputSize(_srcSize);
+        float w = 0.3f, h = Math.Min(w * output.Width / output.Height, 0.6f); // square where it fits
+        AddItem(new Sticker(_nextId++, 0, 0.5f, 0.5f, w) { Kind = StickerKind.Mosaic, Height = h });
+    }
+
+    void AddItem(Sticker sticker)
+    {
+        var t = Targets();
+        Apply(L.F("{0}개 프레임에 {1} 넣음", t.Count, KindName(sticker.Kind)), () =>
         {
             _stickers[sticker.Id] = sticker;
             foreach (var i in t) _frames[i] = _frames[i] with { Stickers = [.. _frames[i].Stickers ?? [], sticker.Id] };
@@ -1296,9 +1346,24 @@ sealed class EditorForm : Form
         UpdateDecorControls();
     }
 
+    /// <summary>Kind of item as a word used mid-sentence (lower case where the language has case).</summary>
+    static string KindName(StickerKind kind) => (kind switch
+    {
+        StickerKind.Text => L.T("텍스트"),
+        StickerKind.Mosaic => L.T("모자이크"),
+        _ => L.T("이미지"),
+    }).ToLowerInvariant();
+
+    bool HasKind(int position, StickerKind kind) =>
+        _frames[position].Stickers?.Any(id => _stickers.TryGetValue(id, out var s) && s.Kind == kind) == true;
+
+    /// <summary>The item picked in the preview, if it still exists.</summary>
+    Sticker? Picked => _canvas.SelectedSticker is { } id && _stickers.TryGetValue(id, out var s) ? s : null;
+
     void DeleteSticker(int id)
     {
-        Apply(L.T("이미지 삭제"), () =>
+        if (!_stickers.TryGetValue(id, out var sticker)) return;
+        Apply(L.F("{0} 삭제", KindName(sticker.Kind)), () =>
         {
             _stickers.Remove(id);
             for (int i = 0; i < _frames.Count; i++)
@@ -1313,7 +1378,7 @@ sealed class EditorForm : Form
     {
         var t = Targets().Where(i => _frames[i].Stickers?.Contains(id) != true).ToList();
         if (t.Count == 0) { Notify(L.T("선택한 프레임에 이미 표시되어 있습니다"), error: true); return; }
-        Apply(L.F("{0}개 프레임에 이미지 표시", t.Count), () =>
+        Apply(L.F("{0}개 프레임에 {1} 표시", t.Count, KindName(_stickers[id].Kind)), () =>
         {
             foreach (var i in t) _frames[i] = _frames[i] with { Stickers = [.. _frames[i].Stickers ?? [], id] };
             return true;
@@ -1322,9 +1387,10 @@ sealed class EditorForm : Form
 
     void HideStickerFromSelection(int id)
     {
+        var name = KindName(_stickers[id].Kind);
         var t = Targets().Where(i => _frames[i].Stickers?.Contains(id) == true).ToList();
-        if (t.Count == 0) { Notify(L.T("선택한 프레임에는 이 이미지가 없습니다"), error: true); return; }
-        Apply(L.F("{0}개 프레임에서 이미지 뺌", t.Count), () =>
+        if (t.Count == 0) { Notify(L.F("선택한 프레임에는 이 {0}가 없습니다", name), error: true); return; }
+        Apply(L.F("{0}개 프레임에서 {1} 뺌", t.Count, name), () =>
         {
             foreach (var i in t) _frames[i] = _frames[i] with { Stickers = Without(_frames[i].Stickers!, id) };
             if (!_frames.Any(f => f.Stickers?.Contains(id) == true)) _stickers.Remove(id); // shown nowhere: gone
@@ -1338,16 +1404,124 @@ sealed class EditorForm : Form
         return rest.Length == 0 ? null : rest;
     }
 
-    /// <summary>Enables the sticker buttons for the image picked in the preview.</summary>
+    // ───────────── Text look ─────────────
+
+    /// <summary>Look the text controls edit: the picked text's, or with none picked, the next new text's.</summary>
+    TextStyle CurrentTextStyle() => Picked is { Kind: StickerKind.Text } s ? s.Style : _textStyle;
+
+    void SetTextStyle(TextStyle style)
+    {
+        if (_syncingDecor) return;
+        _textStyle = _settings.TextStyle = style; // new text follows the look last chosen
+        if (Picked is { Kind: StickerKind.Text } s && s.Style != style)
+            MergedEdit(("style", s.Id), () => _stickers[s.Id] = s with { Style = style });
+        else UpdateDecorControls();
+    }
+
+    void ChooseTextFont()
+    {
+        var style = CurrentTextStyle();
+        using var current = new Font(style.FontFamily, 14f, style.FontStyle);
+        using var dialog = new FontDialog { Font = current, ShowEffects = false, FontMustExist = true, AllowVerticalFonts = false };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        SetTextStyle(style with { FontFamily = dialog.Font.FontFamily.Name, FontStyle = dialog.Font.Style & (FontStyle.Bold | FontStyle.Italic) });
+    }
+
+    void ChooseTextColor()
+    {
+        var style = CurrentTextStyle();
+        using var dialog = new ColorDialog { Color = Color.FromArgb(style.ColorArgb), FullOpen = true };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        SetTextStyle(style with { ColorArgb = Color.FromArgb(255, dialog.Color).ToArgb() });
+    }
+
+    /// <summary>Enter in the text box: adds the typed text, or with a text picked, finishes editing it.</summary>
+    void CommitText()
+    {
+        if (_textBoxOwner == null)
+        {
+            if (_textBox.Text.Trim().Length == 0) { Notify(L.T("넣을 텍스트를 입력하세요"), error: true); return; }
+            AddText(_textBox.Text);
+            return;
+        }
+        _canvas.SelectedSticker = null;
+        UpdateDecorControls();
+    }
+
+    /// <summary>Shows the picked item in the item controls, with only the rows that apply to its kind.</summary>
     void UpdateDecorControls()
     {
-        bool picked = _canvas.SelectedSticker is { } id && _stickers.ContainsKey(id);
-        if (!picked && _canvas.SelectedSticker != null) _canvas.SelectedSticker = null; // deleted, or undone away
-        _stickerDeleteBtn.Enabled = _stickerShowBtn.Enabled = _stickerHideBtn.Enabled = _stickerOpacity.Enabled = _stickerAngle.Enabled = picked;
+        // An item not on the frame being shown can't be seen or dragged, so it doesn't stay picked.
+        var picked = Picked;
+        if (picked != null && (_frames.Count == 0 || _frames[_current].Stickers?.Contains(picked.Id) != true)) picked = null;
+        if (picked == null && _canvas.SelectedSticker != null) _canvas.SelectedSticker = null;
+        var text = picked is { Kind: StickerKind.Text } ? picked : null;
+
         _syncingDecor = true;
-        _stickerOpacity.Value = picked ? _stickers[_canvas.SelectedSticker!.Value].Opacity : 100;
-        _stickerAngle.Value = picked ? (int)Math.Round(_stickers[_canvas.SelectedSticker!.Value].Angle) : 0;
+        _stickerDeleteBtn.Enabled = _stickerShowBtn.Enabled = _stickerHideBtn.Enabled = picked != null;
+        _pickLabel.Text = picked == null ? L.T("미리보기에서 클릭해 고르기") : L.F("고른 항목  ·  {0}", KindName(picked.Kind));
+        _pickLabel.ForeColor = picked == null ? Theme.Muted : Theme.AccentHover;
+        _stickerOpacity.Value = picked?.Opacity ?? 100;
+        _stickerAngle.Value = (int)Math.Round(picked?.Angle ?? 0);
+        // The box keeps a draft for the next text while nothing is picked; undo can change a picked text's words.
+        if (text?.Id != _textBoxOwner || (text != null && _textBox.Text != text.Text))
+        {
+            _textBox.Text = text?.Text ?? "";
+            _textBox.Select(_textBox.TextLength, 0);
+            _textBoxOwner = text?.Id;
+        }
+        var style = text?.Style ?? _textStyle;
+        _textFontBtn.Text = style.FontFamily;
+        _textColorBtn.Color = Color.FromArgb(style.ColorArgb);
+        _textSize.Value = Math.Clamp((int)Math.Round(style.Size * 100), _textSize.Minimum, _textSize.Maximum);
+        _textOutline.Checked = style.Outline;
+        _textBackdrop.Checked = style.Box;
+        if (picked is { Kind: StickerKind.Mosaic }) _mosaicCell.Value = picked.Cell;
         _syncingDecor = false;
+        LayoutItemControls(picked?.Kind);
+    }
+
+    /// <summary>
+    /// Stacks the rows for the picked item under the add buttons: text settings for a text (or, with nothing picked, for
+    /// the next text), the cell size for a mosaic, then the settings every item has.
+    /// </summary>
+    void LayoutItemControls(StickerKind? kind)
+    {
+        int key = kind is { } k ? (int)k : -1;
+        if (key == _layerLayout) return;
+        _layerLayout = key;
+        bool text = kind is null or StickerKind.Text, mosaic = kind == StickerKind.Mosaic, any = kind != null;
+
+        // Design units, scaled the way the form scaled everything else; the panel may be scrolled.
+        float s = _textAddBtn.Height / 36f;
+        int top = _decorPanel.AutoScrollPosition.Y;
+        const int L0 = 20, R = 146, W = 118, Full = 244;
+        int y = 494;
+        void Put(Control c, int x, int w, int h)
+        {
+            c.Bounds = new Rectangle((int)Math.Round(x * s), (int)Math.Round(y * s) + top, (int)Math.Round(w * s), (int)Math.Round(h * s));
+            c.Visible = true;
+        }
+        foreach (var c in new Control[] { _textBox, _textFontBtn, _textColorBtn, _textSize, _textOutline, _textBackdrop, _mosaicCell,
+            _stickerOpacity, _stickerAngle, _stickerShowBtn, _stickerHideBtn })
+            c.Visible = false;
+
+        Put(_pickLabel, L0, Full, 24); y += 30;
+        if (text)
+        {
+            Put(_textBox, L0, Full, 30); y += 38;
+            Put(_textFontBtn, L0, W, 36); Put(_textColorBtn, R, W, 36); y += 42;
+            Put(_textSize, L0, Full, 50); y += 54;
+            Put(_textBackdrop, L0, W, 30); Put(_textOutline, R, W, 30); y += 38;
+        }
+        if (mosaic) { Put(_mosaicCell, L0, Full, 50); y += 54; }
+        if (any)
+        {
+            Put(_stickerOpacity, L0, W, 50); Put(_stickerAngle, R, W, 50); y += 54;
+            Put(_stickerShowBtn, L0, Full, 36); y += 42;
+            Put(_stickerHideBtn, L0, Full, 36); y += 42;
+        }
+        Put(_layerHint, L0, Full, 40);
     }
 
     // ───────────── Crop ─────────────
@@ -1665,13 +1839,13 @@ sealed class EditorForm : Form
             if (keyData == Keys.Enter) { _ = Export(); return true; }
             if (keyData is not (Keys.Control | Keys.S)) return base.ProcessCmdKey(ref msg, keyData);
         }
-        if (_captionBox.Focused)
+        if (_textBox.Focused)
         {
-            if (keyData == Keys.Enter) { SetCaption(_captionBox.Text.Trim()); return true; }
+            if (keyData == Keys.Enter) { CommitText(); return true; }
             if (keyData is not (Keys.Control | Keys.S) and not (Keys.Control | Keys.Z) and not (Keys.Control | Keys.Y))
                 return base.ProcessCmdKey(ref msg, keyData);
         }
-        if (ActiveControl is TextBox box && box != _nameBox && box != _captionBox)
+        if (ActiveControl is TextBox box && box != _nameBox && box != _textBox)
         {
             // Other text fields (the watermark text) keep every key except save.
             if (keyData is not (Keys.Control | Keys.S)) return base.ProcessCmdKey(ref msg, keyData);

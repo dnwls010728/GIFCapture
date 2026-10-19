@@ -11,10 +11,12 @@ sealed class Timeline : Control
     /// <summary>Thumbnail for a timeline position, or null while it is still being generated.</summary>
     public Func<int, Bitmap?>? ThumbnailFor { get; set; }
     public Func<int, int>? DelayFor { get; set; }
-    /// <summary>Whether the frame at a position carries a caption (drawn as a small badge).</summary>
-    public Func<int, bool>? HasCaption { get; set; }
+    /// <summary>Whether the frame at a position carries text (drawn as a small badge).</summary>
+    public Func<int, bool>? HasText { get; set; }
     /// <summary>Whether the frame at a position carries inserted images (drawn as a second badge).</summary>
-    public Func<int, bool>? HasStickers { get; set; }
+    public Func<int, bool>? HasImages { get; set; }
+    /// <summary>Whether part of the frame at a position is pixelated (drawn as a third badge).</summary>
+    public Func<int, bool>? HasMosaic { get; set; }
     public IReadOnlySet<int> Selection { get; set; } = new HashSet<int>();
     public float Aspect { get; set; } = 16 / 9f;
 
@@ -143,8 +145,9 @@ sealed class Timeline : Control
             TextRenderer.DrawText(g, $"{i + 1}", _small, labelRect, i == _current ? Theme.Text : Theme.Muted,
                 TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPadding);
             float badgeRight = r.Right - 4 * s;
-            if (HasCaption?.Invoke(i) == true) badgeRight = Badge(g, "T", Theme.AccentFill, badgeRight, r.Y + 4 * s, s);
-            if (HasStickers?.Invoke(i) == true) Badge(g, "▣", Color.FromArgb(0x1B, 0x7F, 0x53), badgeRight, r.Y + 4 * s, s);
+            if (HasText?.Invoke(i) == true) badgeRight = Badge(g, "T", Theme.AccentFill, badgeRight, r.Y + 4 * s, s);
+            if (HasImages?.Invoke(i) == true) badgeRight = Badge(g, "▣", Color.FromArgb(0x1B, 0x7F, 0x53), badgeRight, r.Y + 4 * s, s);
+            if (HasMosaic?.Invoke(i) == true) Badge(g, "▦", Color.FromArgb(0x8A, 0x4B, 0xB8), badgeRight, r.Y + 4 * s, s);
             if (DelayFor != null && r.Width >= 60 * s)
                 TextRenderer.DrawText(g, $"{DelayFor(i)}ms", _small, labelRect, Theme.Muted,
                     TextFormatFlags.Right | TextFormatFlags.Top | TextFormatFlags.NoPadding);

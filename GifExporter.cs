@@ -94,7 +94,7 @@ static class GifExporter
     }
 
     /// <summary>
-    /// The shared pipeline: FPS cap, then per frame crop → scale → rotate → caption, then merging of near-identical
+    /// The shared pipeline: FPS cap, then per frame crop → scale → rotate → decorations, then merging of near-identical
     /// neighbours. Yields finished pixels with their durations.
     /// </summary>
     static IEnumerable<(byte[] Pixels, int DelayMs)> Render(FrameStore store, IReadOnlyList<EditFrame> frames, ExportOptions o,
@@ -173,14 +173,13 @@ static class GifExporter
             if (!o.Crop.IsEmpty) px = FrameOps.Crop(px, src, o.Crop);
             if (scaled != cropped) px = FrameOps.Scale(px, cropped, scaled, o.Resample);
             if (o.Rotate != RotateFlipType.RotateNoneFlipNone) px = FrameOps.RotateFlip(px, scaled, o.Rotate);
-            bool caption = !string.IsNullOrWhiteSpace(f.Caption);
-            if (caption || decor.Any(f.Stickers)) px = Burn(px, outSize, decor, f.Stickers, caption ? f.Caption : null, sized);
+            if (decor.Any(f.Stickers)) px = Burn(px, outSize, decor, f.Stickers, sized);
             return px;
         }
     }
 
-    /// <summary>Draws stickers, watermark and caption over finished pixels in one bitmap round trip.</summary>
-    static byte[] Burn(byte[] px, Size size, DecorSet decor, int[]? stickers, string? caption,
+    /// <summary>Draws mosaics, stickers and the watermark over finished pixels in one bitmap round trip.</summary>
+    static byte[] Burn(byte[] px, Size size, DecorSet decor, int[]? stickers,
         ConcurrentDictionary<(int? Id, Size Size), ImageAsset> sized)
     {
         using var bmp = FrameOps.ToBitmap(px, size);
@@ -190,8 +189,8 @@ static class GifExporter
             // Images are shrunk to their drawn size once per export; each frame then draws a small bitmap of its own,
             // since GDI+ bitmaps cannot be shared between threads.
             Decor.Draw(g, area, decor, stickers,
-                (id, asset, target) => sized.GetOrAdd((id, target), _ => asset.Resize(target)).CreateBitmap(), disposeBitmaps: true);
-            if (caption != null) Caption.Draw(g, area, caption);
+                (id, asset, target) => sized.GetOrAdd((id, target), _ => asset.Resize(target)).CreateBitmap(), disposeBitmaps: true,
+                () => new PixelSource(px, size.Width, new Rectangle(Point.Empty, size)));
         }
         return FrameOps.FromBitmap(bmp);
     }
@@ -214,32 +213,6 @@ static class GifExporter
             if (++diff > limit) return false;
         }
         return true;
-    }
-}
-
-/// <summary>Caption bar along the bottom of a frame, used identically by the preview and the export.</summary>
-static class Caption
-{
-    /// <summary>Draws the caption into <paramref name="g"/> over an image area <paramref name="area"/>.</summary>
-    public static void Draw(Graphics g, RectangleF area, string text)
-    {
-        float px = Math.Clamp(area.Height * 0.065f, 10f, 64f);
-        using var font = new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel);
-        float maxW = area.Width * 0.92f;
-        var size = g.MeasureString(text, font, (int)maxW);
-        float padX = px * 0.7f, padY = px * 0.35f;
-        float w = Math.Min(maxW, size.Width) + padX * 2, h = size.Height + padY * 2;
-        var box = new RectangleF(area.X + (area.Width - w) / 2, area.Bottom - h - px * 0.6f, w, h);
-
-        var state = g.Save();
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-        using (var path = Theme.RoundRect(box, px * 0.4f))
-        using (var bg = new SolidBrush(Color.FromArgb(205, 16, 16, 20)))
-            g.FillPath(bg, path);
-        using var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-        g.DrawString(text, font, Brushes.White, box, sf);
-        g.Restore(state);
     }
 }
 

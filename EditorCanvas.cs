@@ -100,15 +100,6 @@ sealed class EditorCanvas : Control
 
     public bool Playing { get; set; }
 
-    string? _caption;
-
-    /// <summary>Caption of the current frame, drawn the same way the export burns it in.</summary>
-    public string? Caption
-    {
-        get => _caption;
-        set { if (_caption == value) return; _caption = value; Invalidate(); }
-    }
-
     // ───────────── Rotation preview ─────────────
 
     RotateFlipType _rotate;
@@ -295,8 +286,8 @@ sealed class EditorCanvas : Control
 
         if (!_cropMode)
         {
-            GifCapture.Decor.Draw(g, _dest, _liveDecor ?? _decor, _frameStickers, PreviewBitmap, disposeBitmaps: false);
-            if (!string.IsNullOrWhiteSpace(_caption)) GifCapture.Caption.Draw(g, _dest, _caption);
+            GifCapture.Decor.Draw(g, _dest, _liveDecor ?? _decor, _frameStickers, PreviewBitmap, disposeBitmaps: false,
+                () => ViewPixels((Bitmap)image, src));
             DrawDecorSelection(g, s);
         }
         if (_cropMode) DrawCropOverlay(g, s);
@@ -322,6 +313,8 @@ sealed class EditorCanvas : Control
     public event Action<int?, bool>? DecorSelected;
     /// <summary>A sticker was moved, resized or turned in the preview.</summary>
     public event Action<Sticker>? StickerEdited;
+    /// <summary>A sticker was double-clicked, e.g. to edit its text.</summary>
+    public event Action<int>? StickerActivated;
     /// <summary>The watermark was moved or resized in the preview.</summary>
     public event Action<Watermark>? WatermarkEdited;
 
@@ -365,8 +358,24 @@ sealed class EditorCanvas : Control
         return bmp;
     }
 
+    // Frame pixels for mosaics, read once per shown frame.
+    byte[]? _pixels;
+    Bitmap? _pixelsImage;
+    int _pixelsVersion = -1;
+
+    PixelSource ViewPixels(Bitmap image, Rectangle src)
+    {
+        if (_pixels == null || _pixelsImage != image || _pixelsVersion != _version)
+        {
+            _pixels = FrameOps.FromBitmap(image);
+            _pixelsImage = image;
+            _pixelsVersion = _version;
+        }
+        return new PixelSource(_pixels, image.Width, src);
+    }
+
     RectangleF? StickerScreenRect(DecorSet d, int id) =>
-        d.Stickers.TryGetValue(id, out var s) && d.Images.TryGetValue(s.ImageId, out var a) ? GifCapture.Decor.StickerRect(s, a, _dest) : null;
+        d.Stickers.TryGetValue(id, out var s) ? GifCapture.Decor.StickerRect(s, d, _dest) : null;
 
     RectangleF? WatermarkScreenRect(DecorSet d) => d.HasWatermark ? GifCapture.Decor.WatermarkRect(d.Watermark, d.WatermarkImage, _dest) : null;
 
@@ -377,9 +386,9 @@ sealed class EditorCanvas : Control
     PointF[]? SelectedCorners(DecorSet d)
     {
         if (SelectedRect(d) is not { } r) return null;
-        if (_watermarkSelected || !d.Stickers.TryGetValue(_selectedSticker!.Value, out var s) || !d.Images.TryGetValue(s.ImageId, out var a))
+        if (_watermarkSelected || !d.Stickers.TryGetValue(_selectedSticker!.Value, out var s))
             return [r.Location, new(r.Right, r.Top), new(r.Right, r.Bottom), new(r.Left, r.Bottom)];
-        return GifCapture.Decor.StickerCorners(s, a, _dest);
+        return GifCapture.Decor.StickerCorners(s, d, _dest);
     }
 
     static PointF Mid(PointF a, PointF b) => new((a.X + b.X) / 2, (a.Y + b.Y) / 2);
@@ -428,11 +437,13 @@ sealed class EditorCanvas : Control
             if (Distance(p, c[2]) <= reach) return (_selectedSticker, _watermarkSelected, DecorDrag.Resize);
         }
         if (WatermarkScreenRect(_decor) is { } w && w.Contains(p)) return (null, true, DecorDrag.Move);
+        // Topmost first, as drawn: mosaics lie under everything else.
         if (_frameStickers != null)
-            for (int i = _frameStickers.Length - 1; i >= 0; i--)
-                if (_decor.Stickers.TryGetValue(_frameStickers[i], out var s) && _decor.Images.TryGetValue(s.ImageId, out var a)
-                    && GifCapture.Decor.StickerContains(s, a, _dest, p))
-                    return (_frameStickers[i], false, DecorDrag.Move);
+            foreach (bool mosaics in new[] { false, true })
+                for (int i = _frameStickers.Length - 1; i >= 0; i--)
+                    if (_decor.Stickers.TryGetValue(_frameStickers[i], out var s) && (s.Kind == StickerKind.Mosaic) == mosaics
+                        && GifCapture.Decor.StickerContains(s, _decor, _dest, p))
+                        return (_frameStickers[i], false, DecorDrag.Move);
         return (null, false, DecorDrag.None);
     }
 
@@ -485,18 +496,30 @@ sealed class EditorCanvas : Control
         {
             // Stickers turn and scale about their centre, which keeps both gestures predictable at any angle.
             var center = new PointF(r.X + r.Width / 2, r.Y + r.Height / 2);
+            float k = Math.Max(Distance(p, center) / Math.Max(1, Distance(_decorStart, center)), 8 * S / Math.Max(1, Math.Min(r.Width, r.Height)));
             var changed = _decorDrag switch
             {
                 DecorDrag.Move => s with { X = s.X + dx / _dest.Width, Y = s.Y + dy / _dest.Height },
-                DecorDrag.Resize => s with
-                {
-                    Width = s.Width * Math.Max(Distance(p, center) / Math.Max(1, Distance(_decorStart, center)), 8 * S / Math.Min(r.Width, r.Height)),
-                },
+                DecorDrag.Resize when s.Kind == StickerKind.Mosaic => ResizeMosaic(s, center, p),
+                DecorDrag.Resize when s.Kind == StickerKind.Text => s with { Style = s.Style with { Size = Math.Clamp(s.Style.Size * k, 0.01f, 0.5f) } },
+                DecorDrag.Resize => s with { Width = s.Width * k },
                 _ => s with { Angle = AngleTo(center, p) },
             };
             _liveDecor = _decor with { Stickers = new Dictionary<int, Sticker>(_decor.Stickers) { [s.Id] = changed } };
         }
         Invalidate();
+    }
+
+    /// <summary>A mosaic takes any shape: its corner follows the pointer, measured along the mosaic's own turned axes.</summary>
+    Sticker ResizeMosaic(Sticker s, PointF center, PointF p)
+    {
+        var local = GifCapture.Decor.Rotate(p, center, -s.Angle);
+        float min = 8 * S;
+        return s with
+        {
+            Width = Math.Max(2 * Math.Abs(local.X - center.X), min) / _dest.Width,
+            Height = Math.Max(2 * Math.Abs(local.Y - center.Y), min) / _dest.Height,
+        };
     }
 
     /// <summary>Turn that points the sticker's top at <paramref name="p"/>; Shift snaps to 15° steps.</summary>
@@ -683,6 +706,12 @@ sealed class EditorCanvas : Control
         _drag = Zone.None;
         if (_decorDrag != DecorDrag.None) EndDecorDrag();
         if (_panning) { _panning = false; Cursor = _cropMode ? Cursors.Cross : _zoom > 0 ? Cursors.Hand : Cursors.Default; }
+    }
+
+    protected override void OnMouseDoubleClick(MouseEventArgs e)
+    {
+        base.OnMouseDoubleClick(e);
+        if (e.Button == MouseButtons.Left && HitDecor(e.Location).Sticker is { } id) StickerActivated?.Invoke(id);
     }
 
     Point ClampToFrame(Point p) => _frame == null ? p : new(Math.Clamp(p.X, 0, _frame.Width), Math.Clamp(p.Y, 0, _frame.Height));
